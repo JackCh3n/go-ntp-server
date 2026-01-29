@@ -131,8 +131,12 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	// 记录请求解析完成时间
 	processTime := time.Now().UTC()
 	
+	// 修复：TransmitTimestamp应该尽可能接近实际发送时间
+	// 获取发送前的时间作为TransmitTimestamp
+	t3 := time.Now().UTC()
+	
 	// 构建响应
-	resp := buildNTPResponse(req, t1, t2, processTime, reqID)
+	resp := buildNTPResponse(req, t1, t2, t3, reqID)
 	
 	// 记录发送开始时间
 	sendStart := time.Now().UTC()
@@ -150,7 +154,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	go logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, processTime, sendStart, sendEnd, req[0])
 }
 
-func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) []byte {
+func buildNTPResponse(req []byte, t1, t2, t3 time.Time, reqID uint64) []byte {
 	resp := make([]byte, 48)
 	
 	// 保存请求头信息
@@ -159,7 +163,8 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	
 	// 设置NTP响应头
 	// LI=0 (无警告), VN=请求的版本, Mode=4 (服务器模式)
-	resp[0] = (liVnMode & 0xC0) | ((version & 0x07) << 3) | 0x04
+	resp[0] = 0x1C | ((version & 0x07) << 3) // LI=00, VN=请求的版本, Mode=4
+	// 注意：这里修复了LI（Leap Indicator）的设置，应该是00（无警告）
 	
 	// Stratum: 1 (一级服务器，表示与GPS等原子钟同步)
 	resp[1] = 1
@@ -194,7 +199,7 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	setNTPTime(resp[32:40], t2)
 	
 	// 传输时间戳 (T3) - 服务器发送时间
-	setNTPTime(resp[40:48], responseTime)
+	setNTPTime(resp[40:48], t3)
 	
 	return resp
 }
