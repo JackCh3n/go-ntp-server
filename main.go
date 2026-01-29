@@ -105,8 +105,10 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
 	resp := make([]byte, 48)
 	
-	// 复制请求的LI、VN、Mode字段，但将Mode改为服务器模式(4)
-	resp[0] = (req[0] & 0x38) | 0x24 // 保持LI和VN不变，设置Mode=4
+	// 修复版本号问题：设置正确的NTP版本4
+	// 第0字节：LeapIndicator(2 bits) + VersionNumber(3 bits) + Mode(3 bits)
+	// 设置LI=0, VN=4, Mode=4
+	resp[0] = 0x24 // 00100100: LI=0, VN=4, Mode=4
 	
 	// Stratum: 2 (二级服务器)
 	resp[1] = 2
@@ -117,17 +119,17 @@ func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
 	// Precision: -20 (约微秒级精度)
 	resp[3] = 0xEC
 	
-	// 根延迟设为1ms
-	binary.BigEndian.PutUint32(resp[4:8], 0x00010000)
+	// 根延迟设为0
+	binary.BigEndian.PutUint32(resp[4:8], 0)
 	
-	// 根离散设为10ms
-	binary.BigEndian.PutUint32(resp[8:12], 0x000A0000)
+	// 根离散设为0
+	binary.BigEndian.PutUint32(resp[8:12], 0)
 	
 	// 参考ID设为"LOCL" (本地时钟)
 	copy(resp[12:16], []byte{'L', 'O', 'C', 'L'})
 	
-	// 参考时间戳：当前时间减去1天
-	refTime := time.Now().UTC().Add(-24 * time.Hour)
+	// 参考时间戳：使用当前时间
+	refTime := time.Now().UTC()
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 从请求复制
