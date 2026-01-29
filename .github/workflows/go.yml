@@ -1,12 +1,11 @@
 name: Build and Release
 
-# 修改触发条件：每次推送代码时都触发
 on:
   push:
     branches:
-      - '*'  # 监听所有分支的推送
+      - '*'
     tags:
-      - '*'  # 同时监听所有标签的推送
+      - '*'
 
 env:
   APP_NAME: ntp-server
@@ -36,25 +35,32 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Initialize Go module
+      run: |
+        go mod init ${{ github.repository }} || true
+        go mod tidy
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
+        cache: true
+        cache-dependency-path: go.sum
 
     - name: Build binary
       env:
         GOOS: ${{ matrix.os }}
         GOARCH: ${{ matrix.arch }}
         OUTPUT_FILE: ${{ matrix.output }}
-        VERSION: ${{ github.sha }}  # 使用提交哈希作为版本号
+        VERSION: ${{ github.sha }}
         COMMIT: ${{ github.sha }}
         BUILD_DATE: ${{ github.event.head_commit.timestamp }}
       run: |
         mkdir -p ${{ env.BUILD_DIR }}
         go build -ldflags "\
-          -X main.Version=$VERSION \
-          -X main.Commit=$COMMIT \
-          -X main.Date=$BUILD_DATE" \
+          -X 'main.Version=$VERSION' \
+          -X 'main.Commit=$COMMIT' \
+          -X 'main.Date=$BUILD_DATE'" \
           -o ${{ env.BUILD_DIR }}/$OUTPUT_FILE main.go
         echo "Built $OUTPUT_FILE for $GOOS/$GOARCH"
 
@@ -90,13 +96,18 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: auto-build-${{ github.sha }}  # 使用提交哈希创建唯一标签
+        tag_name: auto-build-${{ github.sha }}
         name: Auto Build ${{ github.sha }}
         body: |
           Automatic build from commit ${{ github.sha }}
           Triggered by push to branch ${{ github.ref_name }}
+          
+          ## Build Information
+          - **Commit**: ${{ github.sha }}
+          - **Branch**: ${{ github.ref_name }}
+          - **Triggered by**: ${{ github.actor }}
         files: ${{ env.BUILD_DIR }}/*
         draft: false
-        prerelease: true  # 标记为预发布版本
+        prerelease: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

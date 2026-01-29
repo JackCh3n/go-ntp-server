@@ -56,14 +56,16 @@ func main() {
 }
 
 func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
-	// 修复1: 正确设置NTP响应头 (LI=0, VN=4, Mode=4)
+	// 创建响应包
 	resp := make([]byte, 48)
-	resp[0] = 0x24 // 00100100: LI=0, VN=4, Mode=4 (服务器模式)
 	
-	// 修复2: 设置有效的Stratum层级 (1=一级服务器)
+	// 设置NTP头部: LI=0, VN=4, Mode=4 (服务器模式)
+	resp[0] = 0x24 // 00100100: LI=0, VN=4, Mode=4
+	
+	// 设置有效的Stratum层级 (1=一级服务器)
 	resp[1] = 1 // Stratum: 1 (一级服务器)
 	
-	// 修复3: 设置其他必要字段
+	// 设置其他必要字段
 	resp[2] = 0x0A // Poll: 10 (1024秒轮询间隔)
 	resp[3] = 0xEC // Precision: -20 (约微秒级精度)
 	
@@ -72,17 +74,30 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	binary.BigEndian.PutUint32(resp[8:12], 0)
 	
 	// 参考ID设为本地时钟标识
-	copy(resp[12:16], []byte{0x4E, 0x54, 0x50, 0x53}) // "NTPS"
+	copy(resp[12:16], []byte{'L', 'O', 'C', 'L'}) // "LOCL"
 	
-	// 获取当前时间 (T2: 服务器接收时间, T3: 服务器发送时间)
-	receiveTime := time.Now().UTC()
-	transmitTime := receiveTime.Add(10 * time.Millisecond) // 模拟处理延迟
+	// 获取当前时间
+	now := time.Now().UTC()
 	
-	// 修复4: 正确设置时间戳 (NTP格式: 32位秒 + 32位小数秒)
-	setNTPTime(resp[16:24], time.Unix(0, 0)) // 参考时间戳 (可设为0)
+	// 解析请求中的原始时间戳(T1)
+	t1Sec := binary.BigEndian.Uint32(req[40:44])
+	t1Frac := binary.BigEndian.Uint32(req[44:48])
+	
+	// 计算服务器接收时间(T2) - 必须在T1之后
+	t2 := now
+	if t2.UnixNano() <= int64(t1Sec-ntpEpochOffset)*1e9+int64(float64(t1Frac)*(1e9/(1<<32))) {
+		// 如果服务器时间早于T1，人为增加一个微小偏移
+		t2 = t2.Add(100 * time.Millisecond)
+	}
+	
+	// 计算服务器发送时间(T3) - 必须在T2之后
+	t3 := t2.Add(10 * time.Millisecond)
+	
+	// 设置时间戳
+	setNTPTime(resp[16:24], time.Unix(0, 0)) // 参考时间戳 (设为0)
 	setNTPTime(resp[24:32], parseNTPTime(req[40:48])) // 原始时间戳 (T1)
-	setNTPTime(resp[32:40], receiveTime) // 接收时间戳 (T2)
-	setNTPTime(resp[40:48], transmitTime) // 传输时间戳 (T3)
+	setNTPTime(resp[32:40], t2) // 接收时间戳 (T2)
+	setNTPTime(resp[40:48], t3) // 传输时间戳 (T3)
 
 	_, err := conn.WriteToUDP(resp, addr)
 	if err != nil {
@@ -109,5 +124,12 @@ func parseNTPTime(b []byte) time.Time {
 }
 
 func logRequest(addr *net.UDPAddr) {
-	// 保持原有日志功能不变
+	ip := addr.IP.String()
+	names, err := net.LookupAddr(ip)
+	hostname := "-"
+	if err == nil && len(names) > 0 {
+		hostname = names[0]
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	logger.Printf("Hora consultada em %s por %s (hostname: %s)\n", now, ip, hostname)
 }
