@@ -1,4 +1,4 @@
-name: Build and Release 1.1
+name: Build and Release 1.2
 
 on:
   push:
@@ -18,16 +18,16 @@ jobs:
         include:
           - os: linux
             arch: amd64
-            output: ${{ env.APP_NAME }}-linux
+            output: ntp-server-linux
           - os: windows
             arch: amd64
-            output: ${{ env.APP_NAME }}-windows.exe
+            output: ntp-server-windows.exe
           - os: darwin
             arch: amd64
-            output: ${{ env.APP_NAME }}-mac
+            output: ntp-server-mac
           - os: darwin
             arch: arm64
-            output: ${{ env.APP_NAME }}-mac-arm
+            output: ntp-server-mac-arm
 
     steps:
     - name: Checkout code
@@ -42,11 +42,11 @@ jobs:
       env:
         GOOS: ${{ matrix.os }}
         GOARCH: ${{ matrix.arch }}
-        OUTPUT: ${{ matrix.output }}
+        OUTPUT_FILE: ${{ matrix.output }}
       run: |
-        mkdir -p $BUILD_DIR
-        go build -o $BUILD_DIR/$OUTPUT main.go
-        echo "Built $OUTPUT for $GOOS/$GOARCH"
+        mkdir -p ${{ env.BUILD_DIR }}
+        go build -o ${{ env.BUILD_DIR }}/$OUTPUT_FILE main.go
+        echo "Built $OUTPUT_FILE for $GOOS/$GOARCH"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -69,11 +69,14 @@ jobs:
 
     - name: Prepare release assets
       run: |
-        cd $BUILD_DIR
-        for dir in */; do
-          cp "${dir}"* .
-          rm -r "$dir"
+        cd ${{ env.BUILD_DIR }}
+        # 解压所有工件到当前目录
+        for d in */; do
+          cp -r "${d}"* .
+          rm -rf "$d"
         done
+        # 删除空目录
+        find . -type d -empty -delete
         ls -lh
 
     - name: Create Release
