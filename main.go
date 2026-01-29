@@ -90,25 +90,16 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	t1 := ntpToTime(t1Sec, t1Frac)
 	
 	// 获取当前时间作为接收时间 (T2)
-	start := time.Now()
-	t2 := start.UTC()
+	t2 := time.Now().UTC()
 	
-	// 确保 T2 >= T1 (物理约束)
-	if t2.Before(t1) {
-		t2 = t1.Add(1 * time.Millisecond)
-	}
+	// 设置参考时间戳（未使用）和原始时间戳（T1）、接收时间戳（T2）
+	setNTPTime(resp[16:24], time.Time{}) // 参考时间戳 (未使用)
+	setNTPTime(resp[24:32], t1)         // 原始时间戳 (T1)
+	setNTPTime(resp[32:40], t2)         // 接收时间戳 (T2)
 	
-	// 处理请求的时间
-	processingTime := time.Since(start)
-	
-	// 发送时间 (T3) 必须晚于 T2
-	t3 := time.Now().UTC().Add(processingTime / 2)
-	
-	// 设置时间戳
-	setNTPTime(resp[16:24], time.Time{})       // 参考时间戳 (未使用)
-	setNTPTime(resp[24:32], t1)               // 原始时间戳 (T1)
-	setNTPTime(resp[32:40], t2)               // 接收时间戳 (T2)
-	setNTPTime(resp[40:48], t3)               // 传输时间戳 (T3)
+	// 在发送前记录传输时间 (T3)
+	t3 := time.Now().UTC()
+	setNTPTime(resp[40:48], t3)         // 传输时间戳 (T3)
 
 	_, err := conn.WriteToUDP(resp, addr)
 	if err != nil {

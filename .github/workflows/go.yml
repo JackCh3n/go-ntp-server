@@ -3,6 +3,9 @@ name: Build and Release
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  create:  # 当创建标签时触发
     tags: [ 'v*' ]
 
 env:
@@ -46,7 +49,7 @@ jobs:
         OUTPUT_FILE: ${{ matrix.output }}
         VERSION: ${{ github.ref_name }}
         COMMIT: ${{ github.sha }}
-        BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+        BUILD_DATE: ${{ github.event.repository.updated_at }}
       run: |
         mkdir -p ${{ env.BUILD_DIR }}
         go build -ldflags "\
@@ -66,7 +69,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')  # 仅当推送版本标签时触发
     permissions:
       contents: write
     
@@ -89,8 +92,8 @@ jobs:
         name: Release ${{ github.ref_name }}
         body: |
           ## Changes in this release
-          - Fixed timestamp handling in NTP responses
-          - Improved GitHub Actions workflow
+          - Fixed timestamp ordering issue (T3 now recorded just before sending)
+          - Improved GitHub Actions workflow triggers
           - Enhanced logging for debugging
           
           ## Build Information
