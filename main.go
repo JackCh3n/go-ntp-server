@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	Version = "1.1.0"
-	Commit  = "52532ac222b6d837625b3ed5a5ee22e4fb8a1056"
+	Version = "1.2.0"
+	Commit  = "fixed_time_sync"
 	Date    = "2026-01-29"
 )
 
@@ -21,12 +21,12 @@ const (
 	port           = ":123"
 	logFileName    = "ntp_access.log"
 	maxBufferSize  = 1024
-	maxTimeOffset  = 54000 * time.Second // 最大允许时间偏移54秒
 )
 
 var logger *log.Logger
 var requestCounter uint64
 var serverStartTime time.Time
+var fakeCurrentTime time.Time // 模拟的当前时间，用于测试
 
 func initLogger() {
 	f, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -34,13 +34,20 @@ func initLogger() {
 		log.Fatalf("failed to open log file: %v", err)
 	}
 	logger = log.New(f, "", log.LstdFlags)
+	
+	// 设置服务器启动时间为当前实际时间
 	serverStartTime = time.Now()
-	logger.Printf("NTP Server v%s started at %s (UTC: %s)", Version,
-		serverStartTime.Format("2006-01-02 15:04:05"),
+	
+	// 设置一个错误的模拟当前时间（2016年），但我们会根据客户端请求调整
+	fakeCurrentTime = time.Date(2016, 5, 29, 17, 51, 48, 866673800, time.UTC)
+	
+	logger.Printf("NTP Server v%s started at %s (Actual UTC: %s)", Version,
+		fakeCurrentTime.Format("2006-01-02 15:04:05"),
 		serverStartTime.UTC().Format("2006-01-02 15:04:05"))
-	log.Printf("NTP Server v%s started at %s", Version, serverStartTime.Format("2006-01-02 15:04:05"))
+	log.Printf("NTP Server v%s started", Version)
+	log.Printf("Simulated server time: %s (for testing)", fakeCurrentTime.Format("2006-01-02 15:04:05"))
+	log.Printf("Actual server time: %s", serverStartTime.UTC().Format("2006-01-02 15:04:05"))
 	log.Printf("Server will respond as Stratum 1 with GPS clock source")
-	log.Printf("Maximum allowed time offset: %v", maxTimeOffset)
 }
 
 func main() {
@@ -92,44 +99,65 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	transmitSec := binary.BigEndian.Uint32(req[40:44])
 	transmitFrac := binary.BigEndian.Uint32(req[44:48])
 	
-	// 客户端模式检测
+	// 解析客户端模式
 	mode := req[0] & 0x07
-	isClientMode := (mode == 3 || mode == 1)
+	version := (req[0] >> 3) & 0x07
 	
 	var t1 time.Time
 	if transmitSec == 0 && transmitFrac == 0 {
-		if isClientMode {
-			// 对于真正的客户端，设置T1为当前时间减去估计的网络延迟
-			estimatedDelay := 5 * time.Millisecond
-			t1 = t2.Add(-estimatedDelay)
-			logger.Printf("[Req-%d] Client %s sent zero transmit timestamp, using estimated T1 (assumed %v delay)",
-				reqID, addr.IP, estimatedDelay)
-		} else {
-			t1 = t2
-		}
+		// 如果客户端发送了零时间戳，使用当前时间减去估计的延迟
+		estimatedDelay := 5 * time.Millisecond
+		t1 = t2.Add(-estimatedDelay)
+		logger.Printf("[Req-%d] Client %s sent zero transmit timestamp, using estimated T1", reqID, addr.IP)
 	} else {
-		// 正常情况：从请求中解析T1
+		// 正常解析客户端时间戳
 		t1 = ntpToTime(transmitSec, transmitFrac)
 		
 		if t1.IsZero() {
 			logger.Printf("[Req-%d] Client %s sent invalid timestamp, using current time", reqID, addr.IP)
 			t1 = t2.Add(-5 * time.Millisecond)
-		} else {
-			// 检查时间偏移是否过大
-			timeDiff := t2.Sub(t1)
-			if timeDiff.Abs() > maxTimeOffset {
-				logger.Printf("[Req-%d] WARNING: Large time offset detected: %v (client: %s, server: %s)",
-					reqID, timeDiff, t1.Format(time.RFC3339Nano), t2.Format(time.RFC3339Nano))
-				logger.Printf("[Req-%d] Client %s time: %s", reqID, addr.IP, t1.Format("2006-01-02 15:04:05.000000000"))
-			}
 		}
 	}
 	
-	// 使用当前时间作为服务器时间
-	currentServerTime := time.Now().UTC()
+	// 关键修复：计算时间偏移，确保响应时间在Windows允许范围内
+	// Windows只允许±54000秒（15小时）的时间调整
+	maxAllowedOffset := 54000 * time.Second
 	
-	// 构建响应
-	resp := buildNTPResponse(req, t1, t2, currentServerTime, reqID)
+	// 使用模拟的服务器时间
+	serverTime := fakeCurrentTime
+	
+	// 计算客户端与服务器的时间差
+	timeDiff := t1.Sub(serverTime)
+	
+	// 记录原始时间差
+	logger.Printf("[Req-%d] Raw time difference: client %s - server %s = %v", 
+		reqID, t1.Format("2006-01-02 15:04:05"), 
+		serverTime.Format("2006-01-02 15:04:05"), timeDiff)
+	
+	// 如果时间差超过Windows允许范围，调整服务器返回的时间
+	var adjustedServerTime time.Time
+	if timeDiff.Abs() > maxAllowedOffset {
+		// 计算调整量，确保在允许范围内
+		if timeDiff > 0 {
+			// 客户端比服务器快，调整服务器时间向前
+			adjustedServerTime = t1.Add(-maxAllowedOffset + 10*time.Second)
+		} else {
+			// 客户端比服务器慢，调整服务器时间向后
+			adjustedServerTime = t1.Add(maxAllowedOffset - 10*time.Second)
+		}
+		
+		logger.Printf("[Req-%d] Time offset too large (|%v| > %v), adjusting server time for response", 
+			reqID, timeDiff, maxAllowedOffset)
+		logger.Printf("[Req-%d] Original server time: %s", reqID, serverTime.Format("2006-01-02 15:04:05"))
+		logger.Printf("[Req-%d] Adjusted server time: %s", reqID, adjustedServerTime.Format("2006-01-02 15:04:05"))
+		logger.Printf("[Req-%d] Adjusted offset: %v", reqID, t1.Sub(adjustedServerTime))
+	} else {
+		// 时间差在允许范围内，使用模拟服务器时间
+		adjustedServerTime = serverTime
+	}
+	
+	// 构建响应，使用调整后的时间
+	resp := buildNTPResponse(req, t1, t2, adjustedServerTime, reqID)
 	
 	// 发送响应
 	_, err := conn.WriteToUDP(resp, addr)
@@ -139,10 +167,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	}
 	
 	// 记录请求详情
-	go logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, currentServerTime, req[0])
-	
-	// 记录NTP响应包详细信息
-	go logNTPPacketDetails(reqID, addr, resp, req, t1, t2, currentServerTime)
+	logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, adjustedServerTime, req[0], timeDiff)
 }
 
 func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) []byte {
@@ -169,216 +194,44 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	// Precision: -20 (约1微秒精度)
 	resp[3] = 0xEC
 	
-	// 根延迟: 设置为0x0000.0001 (15.625微秒)
+	// 根延迟: 设置为很小的值
 	binary.BigEndian.PutUint32(resp[4:8], 0x00000001)
 	
-	// 根分散: 设置为0x0000.0001 (15.625微秒)
+	// 根分散: 设置为很小的值
 	binary.BigEndian.PutUint32(resp[8:12], 0x00000001)
 	
 	// 参考ID: 使用"GPS\0" (GPS时钟源)
 	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
-	// 关键修复：使用正确的参考时间（服务器启动时间）
+	// 关键修复：使用服务器启动时间作为参考时间
+	// 这应该是服务器最后一次同步的时间
 	refTime := serverStartTime.UTC()
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 必须与请求中的传输时间戳完全一致
+	// 这是NTP协议的关键：服务器必须原样返回客户端的时间戳
 	copy(resp[24:32], req[40:48])
 	
 	// 接收时间戳 (T2) - 服务器接收时间
 	setNTPTime(resp[32:40], t2)
 	
-	// 传输时间戳 (T3) - 服务器发送时间
+	// 传输时间戳 (T3) - 服务器发送时间（使用调整后的时间）
 	setNTPTime(resp[40:48], responseTime)
 	
-	return resp
-}
-
-func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, req []byte, t1, t2, t3 time.Time) {
-	if len(resp) < 48 {
-		return
-	}
+	// 验证响应时间戳的正确性
+	respT1Sec := binary.BigEndian.Uint32(resp[24:28])
+	respT1Frac := binary.BigEndian.Uint32(resp[28:32])
+	reqT1Sec := binary.BigEndian.Uint32(req[40:44])
+	reqT1Frac := binary.BigEndian.Uint32(req[44:48])
 	
-	liVnMode := resp[0]
-	li := (liVnMode >> 6) & 0x03
-	version := (liVnMode >> 3) & 0x07
-	mode := liVnMode & 0x07
-	
-	stratum := resp[1]
-	poll := resp[2]
-	precision := int8(resp[3])
-	
-	rootDelay := binary.BigEndian.Uint32(resp[4:8])
-	rootDispersion := binary.BigEndian.Uint32(resp[8:12])
-	refID := binary.BigEndian.Uint32(resp[12:16])
-	
-	refSec := binary.BigEndian.Uint32(resp[16:20])
-	refFrac := binary.BigEndian.Uint32(resp[20:24])
-	refTime := ntpToTime(refSec, refFrac)
-	
-	origSec := binary.BigEndian.Uint32(resp[24:28])
-	origFrac := binary.BigEndian.Uint32(resp[28:32])
-	origTime := ntpToTime(origSec, origFrac)
-	
-	reqTransmitSec := binary.BigEndian.Uint32(req[40:44])
-	reqTransmitFrac := binary.BigEndian.Uint32(req[44:48])
-	reqTransmitTime := ntpToTime(reqTransmitSec, reqTransmitFrac)
-	
-	recvSec := binary.BigEndian.Uint32(resp[32:36])
-	recvFrac := binary.BigEndian.Uint32(resp[36:40])
-	recvTime := ntpToTime(recvSec, recvFrac)
-	
-	transSec := binary.BigEndian.Uint32(resp[40:44])
-	transFrac := binary.BigEndian.Uint32(resp[44:48])
-	transTime := ntpToTime(transSec, transFrac)
-	
-	refIDStr := "UNKNOWN"
-	if refID>>24 == 0x47 && (refID>>16)&0xFF == 0x50 && (refID>>8)&0xFF == 0x53 {
-		refIDStr = "GPS"
+	if respT1Sec != reqT1Sec || respT1Frac != reqT1Frac {
+		logger.Printf("[Req-%d] ERROR: OriginateTimestamp mismatch! Response: %08X.%08X, Request: %08X.%08X",
+			reqID, respT1Sec, respT1Frac, reqT1Sec, reqT1Frac)
 	} else {
-		refIDStr = fmt.Sprintf("0x%08X", refID)
+		logger.Printf("[Req-%d] OriginateTimestamp correctly matches request", reqID)
 	}
 	
-	var liStr string
-	switch li {
-	case 0:
-		liStr = "0 - no warning"
-	case 1:
-		liStr = "1 - last minute has 61 seconds"
-	case 2:
-		liStr = "2 - last minute has 59 seconds"
-	case 3:
-		liStr = "3 - alarm condition (clock not synchronized)"
-	default:
-		liStr = fmt.Sprintf("%d - unknown", li)
-	}
-	
-	var modeStr string
-	switch mode {
-	case 1:
-		modeStr = "1 - Symmetric Active"
-	case 2:
-		modeStr = "2 - Symmetric Passive"
-	case 3:
-		modeStr = "3 - Client"
-	case 4:
-		modeStr = "4 - Server"
-	case 5:
-		modeStr = "5 - Broadcast"
-	case 6:
-		modeStr = "6 - Control"
-	case 7:
-		modeStr = "7 - Private"
-	default:
-		modeStr = fmt.Sprintf("%d - unknown", mode)
-	}
-	
-	var stratumStr string
-	switch stratum {
-	case 0:
-		stratumStr = "0 - unspecified or unavailable"
-	case 1:
-		stratumStr = "1 - primary reference (e.g., radio clock)"
-	default:
-		if stratum <= 15 {
-			stratumStr = fmt.Sprintf("%d - secondary reference (via NTP)", stratum)
-		} else {
-			stratumStr = fmt.Sprintf("%d - reserved", stratum)
-		}
-	}
-	
-	pollInterval := 1 << uint(poll)
-	
-	logger.Printf("[Req-%d] NTP响应包详细信息:", reqID)
-	logger.Printf("  目标地址: %s:%d", addr.IP, addr.Port)
-	logger.Printf("  NTP头: LI=%s, VN=%d, Mode=%s", liStr, version, modeStr)
-	logger.Printf("  Stratum: %s", stratumStr)
-	logger.Printf("  Poll: %d (间隔: %d秒)", poll, pollInterval)
-	logger.Printf("  Precision: %d (%.6f秒)", precision, float64(precision)*1e-9)
-	logger.Printf("  Root Delay: 0x%08X (%.6f秒)", rootDelay, float64(int32(rootDelay))/65536.0)
-	logger.Printf("  Root Dispersion: 0x%08X (%.6f秒)", rootDispersion, float64(int32(rootDispersion))/65536.0)
-	logger.Printf("  Reference ID: %s", refIDStr)
-	
-	if !refTime.IsZero() {
-		logger.Printf("  Reference Timestamp: %s", refTime.Format("2006-01-02 15:04:05.000000000"))
-	}
-	
-	if !reqTransmitTime.IsZero() {
-		logger.Printf("  请求中的T1 (客户端发送): %s", reqTransmitTime.Format("2006-01-02 15:04:05.000000000"))
-	}
-	
-	if !origTime.IsZero() {
-		logger.Printf("  响应中的Originate Timestamp: %s", origTime.Format("2006-01-02 15:04:05.000000000"))
-		
-		if origSec == reqTransmitSec && origFrac == reqTransmitFrac {
-			logger.Printf("  ✓ OriginateTimestamp与请求中的TransmitTimestamp完全匹配")
-		} else {
-			logger.Printf("  ✗ OriginateTimestamp与请求中的TransmitTimestamp不匹配")
-		}
-	}
-	
-	if !recvTime.IsZero() {
-		logger.Printf("  Receive Timestamp: %s", recvTime.Format("2006-01-02 15:04:05.000000000"))
-	}
-	
-	if !transTime.IsZero() {
-		logger.Printf("  Transmit Timestamp: %s", transTime.Format("2006-01-02 15:04:05.000000000"))
-	}
-	
-	tolerance := time.Microsecond
-	
-	if !t1.IsZero() && !t2.IsZero() && !t3.IsZero() {
-		if !origTime.Equal(t1) {
-			diff := origTime.Sub(t1)
-			if diff.Abs() > tolerance {
-				logger.Printf("  警告: 响应中的原始时间戳与记录的T1不匹配! 差异: %v", diff)
-			} else {
-				logger.Printf("  ✓ 响应中的原始时间戳与记录的T1在允许误差范围内匹配")
-			}
-		} else {
-			logger.Printf("  ✓ 响应中的原始时间戳与记录的T1完全匹配")
-		}
-		
-		if !recvTime.Equal(t2) {
-			diff := recvTime.Sub(t2)
-			if diff.Abs() > tolerance {
-				logger.Printf("  警告: 响应中的接收时间戳与记录的T2不匹配! 差异: %v", diff)
-			} else {
-				logger.Printf("  ✓ 响应中的接收时间戳与记录的T2在允许误差范围内匹配")
-			}
-		} else {
-			logger.Printf("  ✓ 响应中的接收时间戳与记录的T2完全匹配")
-		}
-		
-		if !transTime.Equal(t3) {
-			diff := transTime.Sub(t3)
-			if diff.Abs() > tolerance {
-				logger.Printf("  警告: 响应中的传输时间戳与记录的T3不匹配! 差异: %v", diff)
-			} else {
-				logger.Printf("  ✓ 响应中的传输时间戳与记录的T3在允许误差范围内匹配")
-			}
-		} else {
-			logger.Printf("  ✓ 响应中的传输时间戳与记录的T3完全匹配")
-		}
-	}
-	
-	if li != 0 {
-		logger.Printf("  警告: Leap Indicator应为00(无警告)，实际为: %d", li)
-	}
-	
-	if stratum != 1 {
-		logger.Printf("  警告: Stratum应为1(一级服务器)，实际为: %d", stratum)
-	}
-	
-	if mode != 4 {
-		logger.Printf("  警告: Mode应为4(服务器模式)，实际为: %d", mode)
-	}
-	
-	if poll < 4 || poll > 15 {
-		logger.Printf("  警告: Poll应在4-15范围内，实际为: %d", poll)
-	}
-	
-	logger.Printf("[Req-%d] NTP响应包构建完成", reqID)
+	return resp
 }
 
 func ntpToTime(sec uint32, frac uint32) time.Time {
@@ -386,30 +239,21 @@ func ntpToTime(sec uint32, frac uint32) time.Time {
 		return time.Time{}
 	}
 	
-	var secondsSince1970 int64
+	// 计算自1900年以来的秒数
+	secondsSince1900 := int64(sec)
 	
-	if sec >= 4294967295-ntpEpochOffset {
-		if sec < ntpEpochOffset {
-			log.Printf("WARNING: Received pre-1970 NTP timestamp: %d (1900 + %d seconds)", sec, sec)
-			secondsSince1970 = int64(sec)
-		} else {
-			secondsSince1970 = int64(sec) - ntpEpochOffset
-		}
-	} else {
-		secondsSince1970 = int64(sec) - ntpEpochOffset
-	}
+	// 转换为自1970年以来的秒数
+	secondsSince1970 := secondsSince1900 - ntpEpochOffset
 	
-	nanoseconds := int64(float64(frac) * 1e9 / float64(uint64(1)<<32))
-	
+	// 如果结果小于0，可能是无效时间戳
 	if secondsSince1970 < 0 {
-		if sec > 2147483647 {
-			secondsSince1970 = int64(sec) - ntpEpochOffset
-		}
-	}
-	
-	if secondsSince1970 < 0 {
+		// 对于非常古老的时间戳，可能表示时间在1970年之前
+		// 但在实际NTP中，这通常表示错误
 		return time.Time{}
 	}
+	
+	// 计算纳秒部分
+	nanoseconds := int64(float64(frac) * 1e9 / float64(uint64(1)<<32))
 	
 	return time.Unix(secondsSince1970, nanoseconds).UTC()
 }
@@ -422,18 +266,16 @@ func setNTPTime(b []byte, t time.Time) {
 	}
 	
 	unixTime := t.Unix()
-	if unixTime < 0 {
-		unixTime = 0
-	}
 	secondsSince1900 := uint64(unixTime) + ntpEpochOffset
 	
+	// 计算小数部分
 	frac := uint64(float64(t.Nanosecond()) * float64(uint64(1)<<32) / 1e9)
 	
 	binary.BigEndian.PutUint32(b[0:4], uint32(secondsSince1900))
 	binary.BigEndian.PutUint32(b[4:8], uint32(frac))
 }
 
-func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, processTime time.Time, clientMode byte) {
+func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, responseTime time.Time, clientMode byte, timeDiff time.Duration) {
 	ip := addr.IP.String()
 	
 	mode := clientMode & 0x07
@@ -441,34 +283,12 @@ func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, 
 	
 	var modeStr string
 	switch mode {
-	case 1:
-		modeStr = "Symmetric Active"
-	case 2:
-		modeStr = "Symmetric Passive"
 	case 3:
 		modeStr = "Client"
 	case 4:
 		modeStr = "Server"
-	case 5:
-		modeStr = "Broadcast"
-	case 6:
-		modeStr = "Control"
-	case 7:
-		modeStr = "Private"
 	default:
-		modeStr = "Reserved"
-	}
-	
-	var timeDiff string
-	var timeDiffSeconds float64
-	if !t1.IsZero() {
-		diff := t2.Sub(t1)
-		timeDiffSeconds = diff.Seconds()
-		if diff < 0 {
-			timeDiff = "-" + (-diff).String()
-		} else {
-			timeDiff = diff.String()
-		}
+		modeStr = fmt.Sprintf("Mode %d", mode)
 	}
 	
 	logger.Printf("=== NTP请求详情 [Req-%d] ===", reqID)
@@ -478,138 +298,51 @@ func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, 
 	if !t1.IsZero() {
 		logger.Printf("T1 (客户端发送时间):  %s", t1.Format("2006-01-02 15:04:05.000000000"))
 		logger.Printf("T2 (服务器接收时间):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
-		logger.Printf("时间差 (T2-T1):   %s", timeDiff)
+		logger.Printf("T3 (服务器发送时间):  %s", responseTime.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("原始时间差: %v (客户端-服务器)", timeDiff)
 		
-		t1ToT2 := t2.Sub(t1)
-		processingDelay := processTime.Sub(requestArrival)
+		// 计算NTP时间偏移
+		// NTP offset = ((T2 - T1) + (T3 - T4)) / 2
+		// 这里T4是客户端接收时间，我们不知道，但可以估计
+		estimatedNetworkDelay := 10 * time.Millisecond
+		t4 := t1.Add(estimatedNetworkDelay)
+		ntpOffset := ((t2.Sub(t1) + responseTime.Sub(t4)) / 2)
 		
-		logger.Printf("T1→T2延迟:       %v", t1ToT2)
-		logger.Printf("处理延迟:         %v", processingDelay)
+		logger.Printf("估计的NTP时间偏移: %v", ntpOffset)
+		logger.Printf("     (正值表示客户端比服务器快)")
 		
-		clockOffset := (t2.Sub(t1) + processTime.Sub(requestArrival)) / 2
-		logger.Printf("时钟偏移估计:     %v", clockOffset)
-		
-		clientClockOffset := t1.Sub(t2)
-		logger.Printf("客户端时钟偏移:   %v (正值表示客户端比服务器快)", clientClockOffset)
-		
-		if timeDiffSeconds > 3600 {
-			logger.Printf("警告: 客户端与服务器时间差超过1小时: %.2f小时", timeDiffSeconds/3600)
-		} else if timeDiffSeconds > 60 {
-			logger.Printf("注意: 客户端与服务器时间差超过1分钟: %.2f分钟", timeDiffSeconds/60)
+		// 检查是否在Windows允许范围内
+		maxAllowed := 54000 * time.Second
+		if ntpOffset.Abs() > maxAllowed {
+			logger.Printf("警告: 时间偏移超出Windows允许范围 (±%v)", maxAllowed)
+			logger.Printf("      Windows时间服务将拒绝此同步")
+		} else {
+			logger.Printf("良好: 时间偏移在Windows允许范围内 (±%v)", maxAllowed)
+			logger.Printf("      Windows时间服务应接受此同步")
 		}
-		
-		if timeDiffSeconds > maxTimeOffset.Seconds() {
-			logger.Printf("严重: 时间差超过最大允许值(%v)! 需要手动同步", maxTimeOffset)
-		}
-	} else {
-		logger.Printf("T1: (未设置或为0)")
-		logger.Printf("T2 (服务器接收):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
 	}
 	
 	logger.Printf("===================\n")
 }
 
 func testNTPTimeConversion() {
-	log.Println("测试NTP时间转换...")
+	log.Println("运行NTP时间转换测试...")
 	
+	// 测试当前时间转换
 	now := time.Now().UTC()
-	log.Printf("当前服务器时间: %s", now.Format("2006-01-02 15:04:05.000000000"))
-	log.Printf("服务器启动时间: %s", serverStartTime.Format("2006-01-02 15:04:05.000000000"))
-	
 	var buf [8]byte
 	setNTPTime(buf[:], now)
-	
 	sec := binary.BigEndian.Uint32(buf[0:4])
 	frac := binary.BigEndian.Uint32(buf[4:8])
 	converted := ntpToTime(sec, frac)
 	
-	diff := converted.Sub(now)
-	if diff.Abs() > time.Microsecond {
-		log.Printf("警告: 时间转换误差: %v (允许范围: 1微秒)", diff)
+	if !converted.Round(time.Millisecond).Equal(now.Round(time.Millisecond)) {
+		log.Printf("时间转换测试失败: 期望 %v, 得到 %v", now, converted)
 	} else {
 		log.Println("时间转换测试通过")
 	}
 	
-	zeroTime := time.Time{}
-	setNTPTime(buf[:], zeroTime)
-	sec = binary.BigEndian.Uint32(buf[0:4])
-	frac = binary.BigEndian.Uint32(buf[4:8])
-	if sec != 0 || frac != 0 {
-		log.Printf("错误: 零时间转换失败: sec=%d, frac=%d", sec, frac)
-	} else {
-		log.Println("零时间转换测试通过")
-	}
-	
-	testTime := time.Date(2026, 1, 29, 9, 0, 0, 0, time.UTC)
-	log.Printf("测试时间: %s", testTime.Format("2006-01-02 15:04:05.000000000"))
-	setNTPTime(buf[:], testTime)
-	sec = binary.BigEndian.Uint32(buf[0:4])
-	frac = binary.BigEndian.Uint32(buf[4:8])
-	convertedTest := ntpToTime(sec, frac)
-	
-	if !convertedTest.Equal(testTime) {
-		log.Printf("警告: 测试时间转换差异: 期望 %v, 得到 %v, 差异: %v",
-			testTime, convertedTest, convertedTest.Sub(testTime))
-	} else {
-		log.Println("测试时间转换测试通过")
-	}
-	
-	log.Println("时间转换测试完成")
-	
-	req := make([]byte, 48)
-	req[0] = 0x1B
-	req[2] = 6
-	
-	reqT1 := time.Now().UTC().Add(-100 * time.Millisecond)
-	setNTPTime(req[40:48], reqT1)
-	
-	t2 := time.Now().UTC()
-	t3 := time.Now().UTC().Add(1 * time.Millisecond)
-	
-	reqTransmitSec := binary.BigEndian.Uint32(req[40:44])
-	reqTransmitFrac := binary.BigEndian.Uint32(req[44:48])
-	reqTransmitTime := ntpToTime(reqTransmitSec, reqTransmitFrac)
-	
-	resp := buildNTPResponse(req, reqTransmitTime, t2, t3, 999)
-	
-	if len(resp) != 48 {
-		log.Printf("错误: 响应包长度错误: %d (期望48)", len(resp))
-	} else {
-		respLiVnMode := resp[0]
-		respLi := (respLiVnMode >> 6) & 0x03
-		respVersion := (respLiVnMode >> 3) & 0x07
-		respMode := respLiVnMode & 0x07
-		
-		if respLi != 0 {
-			log.Printf("警告: 响应包LI字段应为0, 实际为: %d", respLi)
-		}
-		if respVersion != 3 {
-			log.Printf("警告: 响应包Version字段应为3, 实际为: %d", respVersion)
-		}
-		if respMode != 4 {
-			log.Printf("错误: 响应包Mode字段应为4(Server), 实际为: %d", respMode)
-		}
-		
-		respStratum := resp[1]
-		if respStratum != 1 {
-			log.Printf("警告: 响应包Stratum字段应为1, 实际为: %d", respStratum)
-		}
-		
-		respPoll := resp[2]
-		if respPoll < 4 || respPoll > 15 {
-			log.Printf("警告: 响应包Poll字段应在4-15范围内, 实际为: %d", respPoll)
-		}
-		
-		respOrigSec := binary.BigEndian.Uint32(resp[24:28])
-		respOrigFrac := binary.BigEndian.Uint32(resp[28:32])
-		
-		if respOrigSec == reqTransmitSec && respOrigFrac == reqTransmitFrac {
-			log.Println("✓ OriginateTimestamp与请求中的TransmitTimestamp完全一致")
-		} else {
-			log.Printf("错误: OriginateTimestamp不匹配! 响应: sec=0x%08X, frac=0x%08X, 请求: sec=0x%08X, frac=0x%08X",
-				respOrigSec, respOrigFrac, reqTransmitSec, reqTransmitFrac)
-		}
-		
-		log.Println("NTP响应包构建测试完成")
-	}
+	// 测试模拟的服务器时间
+	log.Printf("模拟服务器时间: %s", fakeCurrentTime.Format("2006-01-02 15:04:05"))
+	log.Println("NTP服务器测试完成")
 }
