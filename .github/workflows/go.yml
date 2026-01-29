@@ -37,18 +37,10 @@ jobs:
         COMMIT_HASH=$(git rev-parse HEAD)
         BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         
-        # 如果是标签推送，使用标签名
-        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-          VERSION_TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="$VERSION_TAG"
-          RELEASE_TAG="$VERSION_TAG"
-        else
-          # 对于main分支推送，使用带时间戳的版本号
-          TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
-          VERSION="dev-${SHORT_SHA}-${TIMESTAMP}"
-          # 创建唯一的标签名，避免40位哈希
-          RELEASE_TAG="auto-build-${TIMESTAMP}"
-        fi
+        # 生成v.年.月.日.时.分格式的版本号
+        TIMESTAMP=$(date -u +"v.%Y.%m.%d.%H.%M")
+        VERSION="$TIMESTAMP"
+        RELEASE_TAG="$TIMESTAMP"
         
         echo "full_version=$VERSION" >> $GITHUB_OUTPUT
         echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
@@ -60,67 +52,6 @@ jobs:
         echo "Release tag: $RELEASE_TAG"
         echo "Commit: $SHORT_SHA"
         echo "Build time: $BUILD_TIME"
-
-  package-source:
-    name: Package Source Code
-    needs: prepare
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Create source packages
-      run: |
-        VERSION="${{ needs.prepare.outputs.version }}"
-        mkdir -p ${{ env.BUILD_DIR }}
-        
-        # 创建源代码包
-        SOURCE_TAR="${{ env.APP_NAME }}-source-$VERSION.tar.gz"
-        SOURCE_ZIP="${{ env.APP_NAME }}-source-$VERSION.zip"
-        
-        echo "Creating source packages for version: $VERSION"
-        echo "Creating $SOURCE_TAR and $SOURCE_ZIP"
-        
-        # 排除构建目录和隐藏文件
-        tar -czf ${{ env.BUILD_DIR }}/$SOURCE_TAR \
-          --exclude='.git' \
-          --exclude='.github' \
-          --exclude='.gitignore' \
-          --exclude='.idea' \
-          --exclude='.vscode' \
-          --exclude='*.swp' \
-          --exclude='*.swo' \
-          --exclude='${{ env.BUILD_DIR }}' \
-          .
-        
-        # 创建ZIP包
-        zip -r ${{ env.BUILD_DIR }}/$SOURCE_ZIP . \
-          -x '*.git*' \
-          -x '*.github*' \
-          -x '.idea/*' \
-          -x '.vscode/*' \
-          -x '*.swp' \
-          -x '*.swo' \
-          -x '${{ env.BUILD_DIR }}/*'
-        
-        # 计算源代码包哈希
-        cd ${{ env.BUILD_DIR }}
-        sha256sum $SOURCE_TAR > $SOURCE_TAR.sha256
-        sha256sum $SOURCE_ZIP > $SOURCE_ZIP.sha256
-        cd ..
-        
-        echo "Created source packages: $SOURCE_TAR, $SOURCE_ZIP"
-        ls -lh ${{ env.BUILD_DIR }}
-
-    - name: Upload source artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: source-packages-${{ needs.prepare.outputs.short_sha }}
-        path: ${{ env.BUILD_DIR }}/${{ env.APP_NAME }}-source-*
-        retention-days: 1
 
   build-binaries:
     name: Build Binaries
@@ -195,7 +126,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [prepare, package-source, build-binaries]
+    needs: [prepare, build-binaries]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -208,12 +139,6 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-
-    - name: Download source artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: source-packages-${{ needs.prepare.outputs.short_sha }}
-        path: ${{ env.RELEASE_DIR }}
 
     - name: Download binary artifacts
       run: |
@@ -236,14 +161,13 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Create git tag for main branch builds
-      if: github.ref == 'refs/heads/main'
+    - name: Create git tag
       run: |
         TAG_NAME="${{ needs.prepare.outputs.release_tag }}"
         echo "Creating git tag: $TAG_NAME"
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git tag -a "$TAG_NAME" -m "Automated build from main branch - ${{ needs.prepare.outputs.full_version }}"
+        git tag -a "$TAG_NAME" -m "Automated build - ${{ needs.prepare.outputs.full_version }}"
         git push origin "$TAG_NAME"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -262,47 +186,17 @@ jobs:
     - name: Generate release notes
       id: release_notes
       run: |
-        RELEASE_TITLE=""
-        RELEASE_BODY=""
+        RELEASE_TITLE="${{ needs.prepare.outputs.release_tag }}"
+        RELEASE_BODY="## Release ${{ needs.prepare.outputs.release_tag }}
         
-        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
-          RELEASE_TITLE="Release $TAG_NAME"
-          RELEASE_BODY="## Release $TAG_NAME
-          
-          ### Changes
-          This is a tagged release version $TAG_NAME
-          
-          ### Assets
-          This release contains binaries for multiple platforms and source code packages.
-          
-          ### Build Information
-          - **Version**: ${{ needs.prepare.outputs.version }}
-          - **Commit**: ${{ needs.prepare.outputs.short_sha }}
-          - **Build Time**: ${{ needs.prepare.outputs.build_time }}
-          - **Triggered by**: ${{ github.actor }}"
-        else
-          SHORT_SHA="${{ needs.prepare.outputs.short_sha }}"
-          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S")
-          RELEASE_TITLE="Auto Build from main ($SHORT_SHA)"
-          RELEASE_BODY="## Automated Build
-          
-          This is an automated build from the main branch.
-          
-          ### Assets
-          This release contains binaries for multiple platforms and source code packages.
-          
-          ### Build Information
-          - **Version**: ${{ needs.prepare.outputs.version }}
-          - **Commit**: ${{ needs.prepare.outputs.short_sha }}
-          - **Build Time**: ${{ needs.prepare.outputs.build_time }}
-          - **Triggered by**: ${{ github.actor }}
-          - **Source**: ${{ github.ref }}
-          - **Generated at**: $TIMESTAMP
-          
-          ### Notes
-          This is a pre-release. Use tagged releases for production."
-        fi
+        ### Assets
+        This release contains binaries for multiple platforms.
+        
+        ### Build Information
+        - **Version**: ${{ needs.prepare.outputs.version }}
+        - **Commit**: ${{ needs.prepare.outputs.short_sha }}
+        - **Build Time**: ${{ needs.prepare.outputs.build_time }}
+        - **Triggered by**: ${{ github.actor }}"
         
         echo "release_title=$RELEASE_TITLE" >> $GITHUB_OUTPUT
         echo "release_body<<EOF" >> $GITHUB_OUTPUT
