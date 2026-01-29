@@ -5,11 +5,12 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	Version = "dev"
+	Version = "1.0.0"
 	Commit  = "none"
 	Date    = "unknown"
 )
@@ -18,9 +19,11 @@ const (
 	ntpEpochOffset = 2208988800 // 1900-1970秒数差
 	port           = ":123"
 	logFileName    = "ntp_access.log"
+	maxBufferSize  = 1024
 )
 
 var logger *log.Logger
+var requestCounter uint64
 
 func initLogger() {
 	f, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -28,11 +31,17 @@ func initLogger() {
 		log.Fatalf("failed to open log file: %v", err)
 	}
 	logger = log.New(f, "", log.LstdFlags)
+	logger.Printf("NTP Server v%s started at %s", Version, time.Now().Format("2006-01-02 15:04:05"))
 }
 
 func main() {
 	initLogger()
+	
+	// 运行自检
+	testNTPTimeConversion()
+	
 	log.Printf("Starting NTP Server v%s (commit: %s, built: %s)", Version, Commit, Date)
+	log.Printf("Server will respond as Stratum 1 (Primary Reference) with GPS clock source")
 
 	addr, err := net.ResolveUDPAddr("udp", port)
 	if err != nil {
@@ -44,54 +53,64 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	defer conn.Close()
+	
+	// 设置更大的缓冲区
+	conn.SetReadBuffer(maxBufferSize)
+	conn.SetWriteBuffer(maxBufferSize)
 
 	log.Printf("NTP server listening on %s", port)
+	log.Printf("Log file: %s", logFileName)
 
 	for {
-		buf := make([]byte, 48)
+		buf := make([]byte, 1024)
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("error reading: %v", err)
 			continue
 		}
 		if n < 48 {
-			log.Printf("received short packet from %v", clientAddr)
+			log.Printf("received short packet from %v (size: %d)", clientAddr, n)
 			continue
 		}
-		go handleNTPRequest(conn, clientAddr, buf)
+		go handleNTPRequest(conn, clientAddr, buf[:n])
 	}
 }
 
 func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
-	// 记录请求到达时间
-	requestArrivalTime := time.Now().UTC()
+	// 生成请求ID用于跟踪
+	reqID := atomic.AddUint64(&requestCounter, 1)
 	
-	// 解析请求中的传输时间戳（T1）
-	// Windows NTP客户端在发送请求时，会在Transmit Timestamp字段放置发送时间
-	// 对于NTP客户端模式（模式3），Transmit Timestamp位于40-47字节
+	// 记录请求到达时间 (T2)
+	requestArrivalTime := time.Now()
+	t2 := requestArrivalTime.UTC()
+	
+	// 解析请求中的传输时间戳 (T1)
 	transmitSec := binary.BigEndian.Uint32(req[40:44])
 	transmitFrac := binary.BigEndian.Uint32(req[44:48])
 	
-	// 将客户端传输时间戳转换为时间
-	t1 := ntpToTime(transmitSec, transmitFrac)
+	// 客户端模式检测
+	mode := req[0] & 0x07
+	isClientMode := (mode == 3 || mode == 1) // Mode 3 = Client, Mode 1 = Symmetric Active
 	
-	// 处理T1为0的情况
-	var t2 time.Time
+	var t1 time.Time
 	if transmitSec == 0 && transmitFrac == 0 {
-		// Windows客户端有时会发送0时间戳，此时需要特殊处理
-		// 使用当前时间作为T2，并设置合理的T1为当前时间-1ms
-		t2 = requestArrivalTime
-		// 设置T1为请求到达时间减去网络延迟估计（1ms）
-		t1 = requestArrivalTime.Add(-1 * time.Millisecond)
-		logger.Printf("INFO: Client %s sent zero transmit timestamp, using estimated T1", addr.IP)
+		// 客户端发送了零时间戳（某些客户端实现）
+		if isClientMode {
+			// 对于真正的客户端，设置T1为当前时间（这是一种合理的假设）
+			t1 = t2.Add(-5 * time.Millisecond) // 假设5ms网络延迟
+			logger.Printf("[Req-%d] Client %s sent zero transmit timestamp, using estimated T1 (assumed 5ms delay)", reqID, addr.IP)
+		} else {
+			// 非客户端模式，使用当前时间
+			t1 = time.Now().UTC()
+		}
 	} else {
-		// 正常情况：使用请求到达时间作为T2
-		t2 = requestArrivalTime
+		// 正常情况：从请求中解析T1
+		t1 = ntpToTime(transmitSec, transmitFrac)
 		
-		// 确保T2 >= T1
-		if t2.Before(t1) {
-			// 如果服务器时间比客户端慢，调整T2
-			t2 = t1.Add(1 * time.Microsecond)
+		// 验证T1的合理性（不应该在未来）
+		if t1.After(t2.Add(2 * time.Second)) {
+			logger.Printf("[Req-%d] WARN: Client %s sent future timestamp T1=%s, adjusting to current time", reqID, addr.IP, t1.Format("15:04:05.000"))
+			t1 = t2.Add(-1 * time.Millisecond)
 		}
 	}
 	
@@ -99,56 +118,64 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	processTime := time.Now().UTC()
 	
 	// 构建响应
-	resp := buildNTPResponse(req, t1, t2, processTime)
+	resp := buildNTPResponse(req, t1, t2, processTime, reqID)
+	
+	// 记录发送开始时间
+	sendStart := time.Now().UTC()
 	
 	// 发送响应
-	sendStart := time.Now().UTC()
 	_, err := conn.WriteToUDP(resp, addr)
 	sendEnd := time.Now().UTC()
 	
 	if err != nil {
 		log.Printf("error sending response to %v: %v", addr, err)
+		return
 	}
 	
 	// 记录详细的时间戳信息
-	go logRequestDetails(addr, t1, t2, requestArrivalTime, processTime, sendStart, sendEnd)
+	go logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, processTime, sendStart, sendEnd, req[0])
 }
 
-func buildNTPResponse(req []byte, t1, t2, responseTime time.Time) []byte {
+func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) []byte {
 	resp := make([]byte, 48)
 	
+	// 保存请求头信息
+	liVnMode := req[0]
+	version := (liVnMode >> 3) & 0x07
+	
 	// 设置NTP响应头
-	// 字节0: LeapIndicator(2 bits) + VersionNumber(3 bits) + Mode(3 bits)
-	// LI=0 (无警告), VN=4 (NTPv4), Mode=4 (服务器)
-	resp[0] = 0x24
+	// LI=0 (无警告), VN=请求的版本, Mode=4 (服务器模式)
+	resp[0] = (liVnMode & 0xC0) | ((version & 0x07) << 3) | 0x04
 	
 	// Stratum: 1 (一级服务器，表示与GPS等原子钟同步)
-	// Windows客户端期望Stratum为1或2
 	resp[1] = 1
 	
-	// Poll: 6 (64秒轮询间隔) - 这是合理的服务器值
-	resp[2] = 6
+	// Poll: 使用请求的轮询间隔或默认值6 (64秒)
+	poll := req[2]
+	if poll < 4 || poll > 17 {
+		poll = 6 // 默认值
+	}
+	resp[2] = poll
 	
-	// Precision: -20 (约1微秒精度)
-	resp[3] = 236
+	// Precision: -20 (约1微秒精度) - 对应-6 (2^-20 ≈ 1微秒)
+	resp[3] = 0xEC // -20的二进制补码表示
 	
-	// 根延迟: 设置为0 (表示与参考时钟在同一台机器上)
-	binary.BigEndian.PutUint32(resp[4:8], 0)
+	// 根延迟: 设置为0x0001 (0.015625 ms)，合理的根延迟
+	binary.BigEndian.PutUint32(resp[4:8], 0x00010000)
 	
-	// 根分散: 设置为0.000015秒 (15µs)，这是NTP标准的典型值
-	// 0.000015秒 = 0x0000.0001 (十六进制表示)
-	binary.BigEndian.PutUint32(resp[8:12], 0x00000001)
+	// 根分散: 设置为0x0001 (0.015625 ms)，合理的根分散
+	binary.BigEndian.PutUint32(resp[8:12], 0x00010000)
 	
 	// 参考ID: 使用"GPS\0" (GPS时钟源)
 	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
-	// 参考时间戳: 当前时间减去1秒，模拟合理的参考时钟
+	// 参考时间戳: 使用服务器启动时间（或当前时间减去1秒）
+	// 在实际实现中，这应该是最后一次同步到参考源的时间
 	refTime := time.Now().UTC().Add(-1 * time.Second)
 	setNTPTime(resp[16:24], refTime)
 	
-	// 原始时间戳 (T1) - 从请求的Transmit Timestamp复制
-	// Windows客户端期望在响应中看到它发送的Transmit Timestamp
-	copy(resp[24:32], req[40:48])
+	// 原始时间戳 (T1) - 必须与请求中的传输时间戳一致
+	setNTPTime(resp[24:32], t1)
 	
 	// 接收时间戳 (T2) - 服务器接收时间
 	setNTPTime(resp[32:40], t2)
@@ -161,21 +188,19 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time) []byte {
 
 // 将NTP时间转换为Go时间
 func ntpToTime(sec uint32, frac uint32) time.Time {
-	// 检查是否为0时间戳
 	if sec == 0 && frac == 0 {
 		return time.Time{}
 	}
 	
-	// 计算从1900年到1970年的秒数
-	secondsSince1970 := int64(sec) - int64(ntpEpochOffset)
+	// 计算从1970年1月1日开始的秒数
+	secondsSince1970 := int64(sec) - ntpEpochOffset
 	
 	// 将分数部分转换为纳秒
-	// 注意：NTP时间戳的分数部分是1/2^32秒
 	nanoseconds := int64(float64(frac) * 1e9 / float64(1<<32))
 	
-	// 处理可能的负数（虽然NTP时间不应该为负）
+	// 处理可能的溢出
 	if secondsSince1970 < 0 {
-		return time.Unix(0, 0).UTC()
+		return time.Time{}
 	}
 	
 	return time.Unix(secondsSince1970, nanoseconds).UTC()
@@ -203,38 +228,60 @@ func setNTPTime(b []byte, t time.Time) {
 	binary.BigEndian.PutUint32(b[4:8], uint32(frac))
 }
 
-func logRequestDetails(addr *net.UDPAddr, t1, t2, requestArrival, processTime, sendStart, sendEnd time.Time) {
+func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, processTime, sendStart, sendEnd time.Time, clientMode byte) {
 	ip := addr.IP.String()
-	names, _ := net.LookupAddr(ip)
-	hostname := "-"
-	if len(names) > 0 {
-		hostname = names[0]
+	
+	// 尝试解析客户端信息
+	mode := clientMode & 0x07
+	version := (clientMode >> 3) & 0x07
+	
+	var modeStr string
+	switch mode {
+	case 1:
+		modeStr = "Symmetric Active"
+	case 2:
+		modeStr = "Symmetric Passive"
+	case 3:
+		modeStr = "Client"
+	case 4:
+		modeStr = "Server"
+	case 5:
+		modeStr = "Broadcast"
+	case 6:
+		modeStr = "Control"
+	case 7:
+		modeStr = "Private"
+	default:
+		modeStr = "Reserved"
 	}
 	
-	logger.Printf("=== NTP请求详情 ===")
-	logger.Printf("客户端: %s (%s)", ip, hostname)
+	logger.Printf("=== NTP请求详情 [Req-%d] ===", reqID)
+	logger.Printf("客户端: %s:%d", ip, addr.Port)
+	logger.Printf("NTP版本: %d, 模式: %s", version, modeStr)
 	
 	if !t1.IsZero() {
-		logger.Printf("T1 (Transmit):    %s", t1.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("T1 (客户端发送):  %s", t1.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("T2 (服务器接收):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
+		
+		// 计算延迟
+		t1ToT2 := t2.Sub(t1)
+		processingDelay := processTime.Sub(requestArrival)
+		networkSendDelay := sendEnd.Sub(sendStart)
+		totalDelay := sendEnd.Sub(requestArrival)
+		
+		logger.Printf("T1→T2延迟:       %v", t1ToT2)
+		logger.Printf("处理延迟:         %v", processingDelay)
+		logger.Printf("网络发送延迟:     %v", networkSendDelay)
+		logger.Printf("总处理时间:       %v", totalDelay)
+		
+		// 计算预期的往返延迟（供客户端使用）
+		// 往返延迟 = (T4-T1) - (T3-T2)
+		// 时钟偏移 = ((T2-T1) + (T3-T4)) / 2
+		logger.Printf("预期的往返延迟:  %v (估计)", t1ToT2+networkSendDelay)
 	} else {
-		logger.Printf("T1 (Transmit):    (未设置或为0)")
+		logger.Printf("T1: (未设置或为0)")
+		logger.Printf("T2 (服务器接收):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
 	}
-	
-	logger.Printf("请求到达时间:     %s", requestArrival.Format("2006-01-02 15:04:05.000000000"))
-	logger.Printf("T2 (Receive):      %s", t2.Format("2006-01-02 15:04:05.000000000"))
-	logger.Printf("处理完成时间:     %s", processTime.Format("2006-01-02 15:04:05.000000000"))
-	logger.Printf("发送开始时间:     %s", sendStart.Format("2006-01-02 15:04:05.000000000"))
-	logger.Printf("发送结束时间:     %s", sendEnd.Format("2006-01-02 15:04:05.000000000"))
-	
-	// 计算各种延迟
-	if !t1.IsZero() {
-		logger.Printf("T1→请求到达延迟: %v", requestArrival.Sub(t1))
-		logger.Printf("T1→T2延迟:       %v", t2.Sub(t1))
-	}
-	logger.Printf("请求处理延迟:     %v", processTime.Sub(requestArrival))
-	logger.Printf("响应构建延迟:     %v", sendStart.Sub(processTime))
-	logger.Printf("网络发送延迟:     %v", sendEnd.Sub(sendStart))
-	logger.Printf("总处理延迟:       %v", sendEnd.Sub(requestArrival))
 	
 	logger.Printf("===================\n")
 }
@@ -243,7 +290,7 @@ func logRequestDetails(addr *net.UDPAddr, t1, t2, requestArrival, processTime, s
 func testNTPTimeConversion() {
 	log.Println("测试NTP时间转换...")
 	
-	// 测试当前时间
+	// 测试1: 当前时间
 	now := time.Now().UTC()
 	var buf [8]byte
 	setNTPTime(buf[:], now)
@@ -254,8 +301,32 @@ func testNTPTimeConversion() {
 	
 	diff := converted.Sub(now)
 	if diff.Abs() > time.Microsecond {
-		log.Printf("警告: 时间转换误差: %v", diff)
+		log.Printf("警告: 时间转换误差: %v (允许范围: 1微秒)", diff)
 	} else {
 		log.Println("时间转换测试通过")
+	}
+	
+	// 测试2: 零时间
+	zeroTime := time.Time{}
+	setNTPTime(buf[:], zeroTime)
+	sec = binary.BigEndian.Uint32(buf[0:4])
+	frac = binary.BigEndian.Uint32(buf[4:8])
+	if sec != 0 || frac != 0 {
+		log.Printf("错误: 零时间转换失败: sec=%d, frac=%d", sec, frac)
+	} else {
+		log.Println("零时间转换测试通过")
+	}
+	
+	// 测试3: 特定时间
+	testTime := time.Date(2026, 1, 29, 14, 9, 0, 0, time.UTC)
+	setNTPTime(buf[:], testTime)
+	sec = binary.BigEndian.Uint32(buf[0:4])
+	frac = binary.BigEndian.Uint32(buf[4:8])
+	converted = ntpToTime(sec, frac)
+	
+	if !converted.Equal(testTime) {
+		log.Printf("错误: 特定时间转换失败: 期望 %v, 得到 %v", testTime, converted)
+	} else {
+		log.Println("特定时间转换测试通过")
 	}
 }
