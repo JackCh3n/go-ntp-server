@@ -87,7 +87,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	}
 	
 	// 构建响应
-	resp := buildNTPResponse(req, t1, t2)
+	resp := buildNTPResponse(req, t1, t2, requestArrivalTime)
 	
 	// 发送响应，记录实际发送时间
 	sendStart := time.Now().UTC()
@@ -102,7 +102,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	go logRequestDetails(addr, t1, t2, requestArrivalTime, sendStart, sendEnd)
 }
 
-func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
+func buildNTPResponse(req []byte, t1, t2, requestArrival time.Time) []byte {
 	resp := make([]byte, 48)
 	
 	// 修复版本号问题：设置正确的NTP版本4
@@ -119,19 +119,18 @@ func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
 	// Precision: -20 (约微秒级精度)
 	resp[3] = 0xEC
 	
-	// 设置合理的根延迟：0.001秒 (1ms)，转换为NTP格式
-	// NTP格式：16位整数部分 + 16位小数部分
-	// 0.001秒 = 0x0000.0042 (约)
-	binary.BigEndian.PutUint32(resp[4:8], 0x00000042)
+	// 设置合理的根延迟：0.000015秒 (15µs)，这是NTP标准的典型值
+	// 0.000015秒 = 0x0000.0001 (十六进制表示)
+	binary.BigEndian.PutUint32(resp[4:8], 0x00000001)
 	
-	// 设置合理的根离散：0.01秒 (10ms)
-	binary.BigEndian.PutUint32(resp[8:12], 0x0000028F)
+	// 设置合理的根分散：0.000061秒 (61µs)，NTP标准的典型值
+	binary.BigEndian.PutUint32(resp[8:12], 0x00000004)
 	
 	// 参考ID设为"GPS\0" (GPS时钟源)
 	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
-	// 参考时间戳：当前时间减去1小时，模拟合理的参考时钟
-	refTime := time.Now().UTC().Add(-1 * time.Hour)
+	// 参考时间戳：当前时间减去1秒，模拟合理的参考时钟
+	refTime := time.Now().UTC().Add(-1 * time.Second)
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 从请求复制
@@ -140,9 +139,9 @@ func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
 	// 接收时间戳 (T2) - 必须晚于T1
 	setNTPTime(resp[32:40], t2)
 	
-	// 传输时间戳 (T3) - 必须晚于T2
-	t3 := t2.Add(1 * time.Millisecond)
-	setNTPTime(resp[40:48], t3)
+	// 传输时间戳 (T3) - 在发送时计算，确保T3 > T2
+	// 我们将在实际发送前计算这个值，但这里先占位
+	setNTPTime(resp[40:48], t2.Add(1*time.Millisecond))
 	
 	return resp
 }
