@@ -91,15 +91,13 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	t1 := ntpToTime(t1Sec, t1Frac)
 	
 	// 获取当前时间作为接收时间 (T2)
-	// 确保 T2 >= T1 (物理约束)
 	now := time.Now().UTC()
+	
+	// 确保 T2 >= T1 (物理约束)
 	t2 := now
 	if t2.Before(t1) {
 		// 如果系统时间早于T1，使用T1+1ms
 		t2 = t1.Add(1 * time.Millisecond)
-	} else {
-		// 添加微小处理延迟
-		t2 = t2.Add(10 * time.Millisecond)
 	}
 	
 	// 发送时间 (T3) 必须晚于 T2
@@ -116,7 +114,8 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 		log.Printf("error sending response to %v: %v", addr, err)
 	}
 
-	go logRequest(addr)
+	// 记录请求信息
+	go logRequest(addr, t1, t2, t3)
 }
 
 // 将NTP时间转换为Go时间
@@ -142,7 +141,7 @@ func setNTPTime(b []byte, t time.Time) {
 	binary.BigEndian.PutUint32(b[4:8], frac)
 }
 
-func logRequest(addr *net.UDPAddr) {
+func logRequest(addr *net.UDPAddr, t1, t2, t3 time.Time) {
 	ip := addr.IP.String()
 	names, err := net.LookupAddr(ip)
 	hostname := "-"
@@ -151,4 +150,5 @@ func logRequest(addr *net.UDPAddr) {
 	}
 	now := time.Now().Format("2006-01-02 15:04:05")
 	logger.Printf("Request from %s (%s) at %s\n", ip, hostname, now)
+	logger.Printf("Timestamps: T1=%s, T2=%s, T3=%s\n", t1.Format(time.RFC3339Nano), t2.Format(time.RFC3339Nano), t3.Format(time.RFC3339Nano))
 }
