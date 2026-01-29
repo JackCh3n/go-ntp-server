@@ -110,26 +110,28 @@ func buildNTPResponse(req []byte, t1, t2 time.Time) []byte {
 	// 设置LI=0, VN=4, Mode=4
 	resp[0] = 0x24 // 00100100: LI=0, VN=4, Mode=4
 	
-	// Stratum: 2 (二级服务器)
-	resp[1] = 2
+	// Stratum: 1 (一级服务器，表示与GPS等原子钟同步)
+	resp[1] = 1
 	
 	// Poll: 6 (64秒轮询间隔)
-	resp[2] = 6
+	resp[2] = 0x0A // 设置为10，即1024秒，这是NTPv4的标准值
 	
 	// Precision: -20 (约微秒级精度)
 	resp[3] = 0xEC
 	
-	// 根延迟设为0
-	binary.BigEndian.PutUint32(resp[4:8], 0)
+	// 设置合理的根延迟：0.001秒 (1ms)，转换为NTP格式
+	// NTP格式：16位整数部分 + 16位小数部分
+	// 0.001秒 = 0x0000.0042 (约)
+	binary.BigEndian.PutUint32(resp[4:8], 0x00000042)
 	
-	// 根离散设为0
-	binary.BigEndian.PutUint32(resp[8:12], 0)
+	// 设置合理的根离散：0.01秒 (10ms)
+	binary.BigEndian.PutUint32(resp[8:12], 0x0000028F)
 	
-	// 参考ID设为"LOCL" (本地时钟)
-	copy(resp[12:16], []byte{'L', 'O', 'C', 'L'})
+	// 参考ID设为"GPS\0" (GPS时钟源)
+	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
-	// 参考时间戳：使用当前时间
-	refTime := time.Now().UTC()
+	// 参考时间戳：当前时间减去1小时，模拟合理的参考时钟
+	refTime := time.Now().UTC().Add(-1 * time.Hour)
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 从请求复制
