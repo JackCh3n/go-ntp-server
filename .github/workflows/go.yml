@@ -86,11 +86,22 @@ jobs:
     - name: Prepare release assets
       run: |
         cd ${{ env.BUILD_DIR }}
-        for d in */; do
-          cp -r "${d}"* .
-          rm -rf "$d"
-        done
+        # 修复：正确处理子目录结构
+        find . -type f -exec cp {} . \;
         find . -type d -empty -delete
+        # 重命名文件以包含平台信息
+        for file in *; do
+          if [ -f "$file" ] && [ "$file" != "prepare.sh" ]; then
+            ext="${file##*.}"
+            if [ "$ext" = "$file" ]; then
+              newname="${file}-${{ github.sha }}"
+            else
+              basename="${file%.*}"
+              newname="${basename}-${{ github.sha }}.${ext}"
+            fi
+            mv "$file" "$newname"
+          fi
+        done
         ls -lh
 
     - name: Create Release
