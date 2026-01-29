@@ -12,7 +12,7 @@ import (
 
 var (
 	Version = "1.0.0"
-	Commit  = "d62065c2d4f7de8aae08576911db8b171c915a7c"
+	Commit  = "52532ac222b6d837625b3ed5a5ee22e4fb8a1056"
 	Date    = "2026-01-29"
 )
 
@@ -130,7 +130,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	// 记录请求解析完成时间
 	processTime := time.Now().UTC()
 	
-	// 构建响应
+	// 构建响应 - 使用原始的传输时间戳字节
 	resp := buildNTPResponse(req, t1, t2, processTime, reqID)
 	
 	// 记录发送开始时间
@@ -149,7 +149,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	go logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, processTime, sendStart, sendEnd, req[0])
 	
 	// 记录NTP响应包详细信息
-	go logNTPPacketDetails(reqID, addr, resp, t1, t2, processTime)
+	go logNTPPacketDetails(reqID, addr, resp, req, t1, t2, processTime)
 }
 
 func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) []byte {
@@ -197,8 +197,10 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	refTime := time.Now().UTC().Add(-1 * time.Second)
 	setNTPTime(resp[16:24], refTime)
 	
-	// 原始时间戳 (T1) - 必须与请求中的传输时间戳一致
-	setNTPTime(resp[24:32], t1)
+	// 关键修复：直接复制客户端的传输时间戳字节，确保完全一致
+	// 原始时间戳 (T1) - 必须与请求中的传输时间戳完全一致
+	// 不再使用setNTPTime函数，而是直接复制字节
+	copy(resp[24:32], req[40:48])
 	
 	// 接收时间戳 (T2) - 服务器接收时间
 	setNTPTime(resp[32:40], t2)
@@ -209,7 +211,7 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	return resp
 }
 
-func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, t1, t2, t3 time.Time) {
+func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, req []byte, t1, t2, t3 time.Time) {
 	if len(resp) < 48 {
 		return
 	}
@@ -238,6 +240,11 @@ func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, t1, t2, t
 	origSec := binary.BigEndian.Uint32(resp[24:28])
 	origFrac := binary.BigEndian.Uint32(resp[28:32])
 	origTime := ntpToTime(origSec, origFrac)
+	
+	// 解析请求中的传输时间戳
+	reqTransmitSec := binary.BigEndian.Uint32(req[40:44])
+	reqTransmitFrac := binary.BigEndian.Uint32(req[44:48])
+	reqTransmitTime := ntpToTime(reqTransmitSec, reqTransmitFrac)
 	
 	// 解析接收时间戳
 	recvSec := binary.BigEndian.Uint32(resp[32:36])
@@ -324,8 +331,21 @@ func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, t1, t2, t
 		logger.Printf("  Reference Timestamp: 0x%08X%08X", refSec, refFrac)
 	}
 	
+	if !reqTransmitTime.IsZero() {
+		logger.Printf("  请求中的T1 (客户端发送): %s", reqTransmitTime.Format("2006-01-02 15:04:05.000000000"))
+	}
+	
 	if !origTime.IsZero() {
-		logger.Printf("  Originate Timestamp: %s", origTime.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("  响应中的Originate Timestamp: %s", origTime.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("  响应中的Originate Timestamp原始字节: sec=0x%08X, frac=0x%08X", origSec, origFrac)
+		logger.Printf("  请求中的Transmit Timestamp原始字节: sec=0x%08X, frac=0x%08X", reqTransmitSec, reqTransmitFrac)
+		
+		// 检查原始时间戳是否匹配
+		if origSec == reqTransmitSec && origFrac == reqTransmitFrac {
+			logger.Printf("  ✓ OriginateTimestamp与请求中的TransmitTimestamp完全匹配")
+		} else {
+			logger.Printf("  ✗ OriginateTimestamp与请求中的TransmitTimestamp不匹配")
+		}
 	} else {
 		logger.Printf("  Originate Timestamp: 0x%08X%08X", origSec, origFrac)
 	}
@@ -342,17 +362,67 @@ func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, t1, t2, t
 		logger.Printf("  Transmit Timestamp: 0x%08X%08X", transSec, transFrac)
 	}
 	
-	// 验证时间戳关系
+	// 验证时间戳关系 - 允许微小误差
 	if !t1.IsZero() && !t2.IsZero() && !t3.IsZero() {
+		// 允许1微秒的误差
+		tolerance := time.Microsecond
+		
+		// 检查T1是否匹配
 		if !origTime.Equal(t1) {
-			logger.Printf("  警告: 响应中的原始时间戳与记录的T1不匹配!")
+			diff := origTime.Sub(t1)
+			if diff.Abs() > tolerance {
+				logger.Printf("  警告: 响应中的原始时间戳与记录的T1不匹配! 差异: %v", diff)
+			} else {
+				logger.Printf("  ✓ 响应中的原始时间戳与记录的T1在允许误差范围内匹配")
+			}
+		} else {
+			logger.Printf("  ✓ 响应中的原始时间戳与记录的T1完全匹配")
 		}
+		
+		// 检查T2是否匹配
 		if !recvTime.Equal(t2) {
-			logger.Printf("  警告: 响应中的接收时间戳与记录的T2不匹配!")
+			diff := recvTime.Sub(t2)
+			if diff.Abs() > tolerance {
+				logger.Printf("  警告: 响应中的接收时间戳与记录的T2不匹配! 差异: %v", diff)
+			} else {
+				logger.Printf("  ✓ 响应中的接收时间戳与记录的T2在允许误差范围内匹配")
+			}
+		} else {
+			logger.Printf("  ✓ 响应中的接收时间戳与记录的T2完全匹配")
 		}
+		
+		// 检查T3是否匹配
 		if !transTime.Equal(t3) {
-			logger.Printf("  警告: 响应中的传输时间戳与记录的T3不匹配!")
+			diff := transTime.Sub(t3)
+			if diff.Abs() > tolerance {
+				logger.Printf("  警告: 响应中的传输时间戳与记录的T3不匹配! 差异: %v", diff)
+			} else {
+				logger.Printf("  ✓ 响应中的传输时间戳与记录的T3在允许误差范围内匹配")
+			}
+		} else {
+			logger.Printf("  ✓ 响应中的传输时间戳与记录的T3完全匹配")
 		}
+	}
+	
+	// 检查响应包是否满足NTP协议要求
+	// 1. 检查Leap Indicator是否为00
+	if li != 0 {
+		logger.Printf("  警告: Leap Indicator应为00(无警告)，实际为: %d", li)
+	}
+	
+	// 2. 检查Stratum是否为1
+	if stratum != 1 {
+		logger.Printf("  警告: Stratum应为1(一级服务器)，实际为: %d", stratum)
+	}
+	
+	// 3. 检查Mode是否为4(服务器模式)
+	if mode != 4 {
+		logger.Printf("  警告: Mode应为4(服务器模式)，实际为: %d", mode)
+	}
+	
+	// 4. 检查Poll是否在有效范围内
+	if poll < 4 || poll > 15 {
+		logger.Printf("  警告: Poll应在4-15范围内，实际为: %d", poll)
 	}
 	
 	logger.Printf("[Req-%d] NTP响应包构建完成", reqID)
@@ -617,11 +687,19 @@ func testNTPTimeConversion() {
 	req[0] = 0x1B // LI=0, VN=3, Mode=3 (Client)
 	req[2] = 6    // Poll=6 (64秒)
 	
-	t1 := time.Now().UTC().Add(-100 * time.Millisecond)
+	// 设置请求中的传输时间戳
+	reqT1 := time.Now().UTC().Add(-100 * time.Millisecond)
+	setNTPTime(req[40:48], reqT1)
+	
 	t2 := time.Now().UTC()
 	t3 := time.Now().UTC().Add(1 * time.Millisecond)
 	
-	resp := buildNTPResponse(req, t1, t2, t3, 999)
+	// 解析请求中的T1
+	reqTransmitSec := binary.BigEndian.Uint32(req[40:44])
+	reqTransmitFrac := binary.BigEndian.Uint32(req[44:48])
+	reqTransmitTime := ntpToTime(reqTransmitSec, reqTransmitFrac)
+	
+	resp := buildNTPResponse(req, reqTransmitTime, t2, t3, 999)
 	
 	// 验证响应包格式
 	if len(resp) != 48 {
@@ -650,6 +728,17 @@ func testNTPTimeConversion() {
 		respPoll := resp[2]
 		if respPoll < 4 || respPoll > 15 {
 			log.Printf("警告: 响应包Poll字段应在4-15范围内, 实际为: %d", respPoll)
+		}
+		
+		// 检查OriginateTimestamp是否与请求中的TransmitTimestamp完全一致
+		respOrigSec := binary.BigEndian.Uint32(resp[24:28])
+		respOrigFrac := binary.BigEndian.Uint32(resp[28:32])
+		
+		if respOrigSec == reqTransmitSec && respOrigFrac == reqTransmitFrac {
+			log.Println("✓ OriginateTimestamp与请求中的TransmitTimestamp完全一致")
+		} else {
+			log.Printf("错误: OriginateTimestamp不匹配! 响应: sec=0x%08X, frac=0x%08X, 请求: sec=0x%08X, frac=0x%08X",
+				respOrigSec, respOrigFrac, reqTransmitSec, reqTransmitFrac)
 		}
 		
 		log.Println("NTP响应包构建测试完成")
