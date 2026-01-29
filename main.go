@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// 版本信息变量
 var (
 	Version = "dev"
 	Commit  = "none"
@@ -91,31 +90,33 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	t1 := ntpToTime(t1Sec, t1Frac)
 	
 	// 获取当前时间作为接收时间 (T2)
-	now := time.Now().UTC()
+	start := time.Now()
+	t2 := start.UTC()
 	
 	// 确保 T2 >= T1 (物理约束)
-	t2 := now
 	if t2.Before(t1) {
-		// 如果系统时间早于T1，使用T1+1ms
 		t2 = t1.Add(1 * time.Millisecond)
 	}
 	
+	// 处理请求的时间
+	processingTime := time.Since(start)
+	
 	// 发送时间 (T3) 必须晚于 T2
-	t3 := t2.Add(10 * time.Millisecond)
+	t3 := time.Now().UTC().Add(processingTime / 2)
 	
 	// 设置时间戳
-	setNTPTime(resp[16:24], time.Unix(0, 0)) // 参考时间戳 (未使用)
-	setNTPTime(resp[24:32], t1)             // 原始时间戳 (T1)
-	setNTPTime(resp[32:40], t2)             // 接收时间戳 (T2)
-	setNTPTime(resp[40:48], t3)             // 传输时间戳 (T3)
+	setNTPTime(resp[16:24], time.Time{})       // 参考时间戳 (未使用)
+	setNTPTime(resp[24:32], t1)               // 原始时间戳 (T1)
+	setNTPTime(resp[32:40], t2)               // 接收时间戳 (T2)
+	setNTPTime(resp[40:48], t3)               // 传输时间戳 (T3)
 
 	_, err := conn.WriteToUDP(resp, addr)
 	if err != nil {
 		log.Printf("error sending response to %v: %v", addr, err)
 	}
 
-	// 记录请求信息
-	go logRequest(addr, t1, t2, t3)
+	// 记录详细时间戳信息
+	go logTimestamps(addr, t1, t2, t3)
 }
 
 // 将NTP时间转换为Go时间
@@ -131,24 +132,38 @@ func ntpToTime(sec uint32, frac uint32) time.Time {
 
 // 设置NTP时间戳
 func setNTPTime(b []byte, t time.Time) {
-	// 计算从1970年到1900年的秒数
-	sec := uint32(t.Unix() + ntpEpochOffset)
+	var sec uint32
+	var frac uint32
 	
-	// 将纳秒转换为NTP分数部分 (0xFFFF FFFF = 2^32-1)
-	frac := uint32((uint64(t.Nanosecond()) << 32) / 1e9)
+	if t.IsZero() {
+		// 对于参考时间戳，使用0值
+		sec = 0
+		frac = 0
+	} else {
+		// 计算从1970年到1900年的秒数
+		sec = uint32(t.Unix() + ntpEpochOffset)
+		
+		// 将纳秒转换为NTP分数部分 (0xFFFF FFFF = 2^32-1)
+		frac = uint32((uint64(t.Nanosecond()) << 32) / 1e9)
+	}
 	
 	binary.BigEndian.PutUint32(b[0:4], sec)
 	binary.BigEndian.PutUint32(b[4:8], frac)
 }
 
-func logRequest(addr *net.UDPAddr, t1, t2, t3 time.Time) {
+func logTimestamps(addr *net.UDPAddr, t1, t2, t3 time.Time) {
 	ip := addr.IP.String()
 	names, err := net.LookupAddr(ip)
 	hostname := "-"
 	if err == nil && len(names) > 0 {
 		hostname = names[0]
 	}
-	now := time.Now().Format("2006-01-02 15:04:05")
-	logger.Printf("Request from %s (%s) at %s\n", ip, hostname, now)
-	logger.Printf("Timestamps: T1=%s, T2=%s, T3=%s\n", t1.Format(time.RFC3339Nano), t2.Format(time.RFC3339Nano), t3.Format(time.RFC3339Nano))
+	
+	logger.Printf("Request from %s (%s)", ip, hostname)
+	logger.Printf("T1 (Originate): %s", t1.Format(time.RFC3339Nano))
+	logger.Printf("T2 (Receive):   %s", t2.Format(time.RFC3339Nano))
+	logger.Printf("T3 (Transmit):  %s", t3.Format(time.RFC3339Nano))
+	logger.Printf("Delta(T2-T1):  %dns", t2.Sub(t1).Nanoseconds())
+	logger.Printf("Delta(T3-T2):  %dns", t3.Sub(t2).Nanoseconds())
+	logger.Printf("----------------------------------------")
 }
