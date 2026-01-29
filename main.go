@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -115,14 +116,12 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 		t1 = ntpToTime(transmitSec, transmitFrac)
 		
 		// 核心修复：NTP服务器应信任客户端提供的时间戳T1
-		// 客户端会根据服务器的T2、T3和原始T1计算时间偏移
 		if t1.IsZero() {
 			// 无效的时间戳（如1970年之前）
 			logger.Printf("[Req-%d] Client %s sent invalid timestamp, using current time", reqID, addr.IP)
 			t1 = t2.Add(-5 * time.Millisecond)
 		} else {
 			// 记录时间戳，但不调整它
-			// 这是NTP协议的核心：服务器原样返回客户端的T1
 			logger.Printf("[Req-%d] Client %s sent T1=%s (UTC)", 
 				reqID, addr.IP, t1.Format("2006-01-02 15:04:05.000000000"))
 		}
@@ -131,12 +130,8 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	// 记录请求解析完成时间
 	processTime := time.Now().UTC()
 	
-	// 修复：TransmitTimestamp应该尽可能接近实际发送时间
-	// 获取发送前的时间作为TransmitTimestamp
-	t3 := time.Now().UTC()
-	
 	// 构建响应
-	resp := buildNTPResponse(req, t1, t2, t3, reqID)
+	resp := buildNTPResponse(req, t1, t2, processTime, reqID)
 	
 	// 记录发送开始时间
 	sendStart := time.Now().UTC()
@@ -152,9 +147,12 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 	
 	// 记录详细的时间戳信息
 	go logRequestDetails(reqID, addr, t1, t2, requestArrivalTime, processTime, sendStart, sendEnd, req[0])
+	
+	// 记录NTP响应包详细信息
+	go logNTPPacketDetails(reqID, addr, resp, t1, t2, processTime)
 }
 
-func buildNTPResponse(req []byte, t1, t2, t3 time.Time, reqID uint64) []byte {
+func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) []byte {
 	resp := make([]byte, 48)
 	
 	// 保存请求头信息
@@ -163,33 +161,40 @@ func buildNTPResponse(req []byte, t1, t2, t3 time.Time, reqID uint64) []byte {
 	
 	// 设置NTP响应头
 	// LI=0 (无警告), VN=请求的版本, Mode=4 (服务器模式)
-	resp[0] = 0x1C | ((version & 0x07) << 3) // LI=00, VN=请求的版本, Mode=4
-	// 注意：这里修复了LI（Leap Indicator）的设置，应该是00（无警告）
+	// 修复：确保LI设置为00（无警告）
+	resp[0] = ((version & 0x07) << 3) | 0x04 // LI=00, VN=请求的版本, Mode=4
 	
 	// Stratum: 1 (一级服务器，表示与GPS等原子钟同步)
 	resp[1] = 1
 	
 	// Poll: 使用请求的轮询间隔或默认值6 (64秒)
+	// 修复：确保Poll值在有效范围内（4-15，对应16-32768秒）
 	poll := req[2]
-	if poll < 4 || poll > 17 {
-		poll = 6 // 默认值
+	// NTP协议规定：Poll值在4-15范围内（对应16-32768秒）
+	// 如果值不在范围内，使用默认值6（64秒）
+	if poll < 4 || poll > 15 {
+		poll = 6 // 默认值，64秒
 	}
 	resp[2] = poll
 	
-	// Precision: -20 (约1微秒精度) - 对应-6 (2^-20 ≈ 1微秒)
+	// Precision: -20 (约1微秒精度) - 对应-20 (2^-20 ≈ 0.954微秒)
+	// 修复：使用正确的精度值-20（0xEC）
 	resp[3] = 0xEC // -20的二进制补码表示
 	
-	// 根延迟: 设置为0x0001 (0.015625 ms)，合理的根延迟
-	binary.BigEndian.PutUint32(resp[4:8], 0x00010000)
+	// 根延迟: 设置为0x0000.0001 (15.625微秒)，合理的根延迟
+	// 修复：设置为更合理的值0x0000.0001而不是0x0001.0000
+	binary.BigEndian.PutUint32(resp[4:8], 0x00000001)
 	
-	// 根分散: 设置为0x0001 (0.015625 ms)，合理的根分散
-	binary.BigEndian.PutUint32(resp[8:12], 0x00010000)
+	// 根分散: 设置为0x0000.0001 (15.625微秒)，合理的根分散
+	// 修复：设置为更合理的值0x0000.0001而不是0x0001.0000
+	binary.BigEndian.PutUint32(resp[8:12], 0x00000001)
 	
 	// 参考ID: 使用"GPS\0" (GPS时钟源)
 	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
 	// 参考时间戳: 使用服务器启动时间
-	refTime := serverStartTime.UTC()
+	// 修复：使用更合理的参考时间（当前时间减去1秒）
+	refTime := time.Now().UTC().Add(-1 * time.Second)
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 必须与请求中的传输时间戳一致
@@ -199,9 +204,158 @@ func buildNTPResponse(req []byte, t1, t2, t3 time.Time, reqID uint64) []byte {
 	setNTPTime(resp[32:40], t2)
 	
 	// 传输时间戳 (T3) - 服务器发送时间
-	setNTPTime(resp[40:48], t3)
+	setNTPTime(resp[40:48], responseTime)
 	
 	return resp
+}
+
+func logNTPPacketDetails(reqID uint64, addr *net.UDPAddr, resp []byte, t1, t2, t3 time.Time) {
+	if len(resp) < 48 {
+		return
+	}
+	
+	// 解析NTP响应包信息
+	liVnMode := resp[0]
+	li := (liVnMode >> 6) & 0x03
+	version := (liVnMode >> 3) & 0x07
+	mode := liVnMode & 0x07
+	
+	stratum := resp[1]
+	poll := resp[2]
+	precision := int8(resp[3]) // 有符号整数
+	
+	rootDelay := binary.BigEndian.Uint32(resp[4:8])
+	rootDispersion := binary.BigEndian.Uint32(resp[8:12])
+	
+	refID := binary.BigEndian.Uint32(resp[12:16])
+	
+	// 解析参考时间戳
+	refSec := binary.BigEndian.Uint32(resp[16:20])
+	refFrac := binary.BigEndian.Uint32(resp[20:24])
+	refTime := ntpToTime(refSec, refFrac)
+	
+	// 解析原始时间戳
+	origSec := binary.BigEndian.Uint32(resp[24:28])
+	origFrac := binary.BigEndian.Uint32(resp[28:32])
+	origTime := ntpToTime(origSec, origFrac)
+	
+	// 解析接收时间戳
+	recvSec := binary.BigEndian.Uint32(resp[32:36])
+	recvFrac := binary.BigEndian.Uint32(resp[36:40])
+	recvTime := ntpToTime(recvSec, recvFrac)
+	
+	// 解析传输时间戳
+	transSec := binary.BigEndian.Uint32(resp[40:44])
+	transFrac := binary.BigEndian.Uint32(resp[44:48])
+	transTime := ntpToTime(transSec, transFrac)
+	
+	// 构建参考ID字符串
+	refIDStr := "UNKNOWN"
+	if refID>>24 == 0x47 && (refID>>16)&0xFF == 0x50 && (refID>>8)&0xFF == 0x53 {
+		refIDStr = "GPS"
+	} else {
+		refIDStr = fmt.Sprintf("0x%08X", refID)
+	}
+	
+	var liStr string
+	switch li {
+	case 0:
+		liStr = "0 - no warning"
+	case 1:
+		liStr = "1 - last minute has 61 seconds"
+	case 2:
+		liStr = "2 - last minute has 59 seconds"
+	case 3:
+		liStr = "3 - alarm condition (clock not synchronized)"
+	default:
+		liStr = fmt.Sprintf("%d - unknown", li)
+	}
+	
+	var modeStr string
+	switch mode {
+	case 1:
+		modeStr = "1 - Symmetric Active"
+	case 2:
+		modeStr = "2 - Symmetric Passive"
+	case 3:
+		modeStr = "3 - Client"
+	case 4:
+		modeStr = "4 - Server"
+	case 5:
+		modeStr = "5 - Broadcast"
+	case 6:
+		modeStr = "6 - Control"
+	case 7:
+		modeStr = "7 - Private"
+	default:
+		modeStr = fmt.Sprintf("%d - unknown", mode)
+	}
+	
+	var stratumStr string
+	switch stratum {
+	case 0:
+		stratumStr = "0 - unspecified or unavailable"
+	case 1:
+		stratumStr = "1 - primary reference (e.g., radio clock)"
+	default:
+		if stratum <= 15 {
+			stratumStr = fmt.Sprintf("%d - secondary reference (via NTP)", stratum)
+		} else {
+			stratumStr = fmt.Sprintf("%d - reserved", stratum)
+		}
+	}
+	
+	// 计算Poll间隔（秒）
+	pollInterval := 1 << uint(poll) // 2^poll 秒
+	
+	logger.Printf("[Req-%d] NTP响应包详细信息:", reqID)
+	logger.Printf("  目标地址: %s:%d", addr.IP, addr.Port)
+	logger.Printf("  NTP头: LI=%s, VN=%d, Mode=%s", liStr, version, modeStr)
+	logger.Printf("  Stratum: %s", stratumStr)
+	logger.Printf("  Poll: %d (间隔: %d秒)", poll, pollInterval)
+	logger.Printf("  Precision: %d (%.6f秒)", precision, float64(precision)*1e-9)
+	logger.Printf("  Root Delay: 0x%08X (%.6f秒)", rootDelay, float64(int32(rootDelay))/65536.0)
+	logger.Printf("  Root Dispersion: 0x%08X (%.6f秒)", rootDispersion, float64(int32(rootDispersion))/65536.0)
+	logger.Printf("  Reference ID: %s", refIDStr)
+	
+	if !refTime.IsZero() {
+		logger.Printf("  Reference Timestamp: %s", refTime.Format("2006-01-02 15:04:05.000000000"))
+	} else {
+		logger.Printf("  Reference Timestamp: 0x%08X%08X", refSec, refFrac)
+	}
+	
+	if !origTime.IsZero() {
+		logger.Printf("  Originate Timestamp: %s", origTime.Format("2006-01-02 15:04:05.000000000"))
+	} else {
+		logger.Printf("  Originate Timestamp: 0x%08X%08X", origSec, origFrac)
+	}
+	
+	if !recvTime.IsZero() {
+		logger.Printf("  Receive Timestamp: %s", recvTime.Format("2006-01-02 15:04:05.000000000"))
+	} else {
+		logger.Printf("  Receive Timestamp: 0x%08X%08X", recvSec, recvFrac)
+	}
+	
+	if !transTime.IsZero() {
+		logger.Printf("  Transmit Timestamp: %s", transTime.Format("2006-01-02 15:04:05.000000000"))
+	} else {
+		logger.Printf("  Transmit Timestamp: 0x%08X%08X", transSec, transFrac)
+	}
+	
+	// 验证时间戳关系
+	if !t1.IsZero() && !t2.IsZero() && !t3.IsZero() {
+		if !origTime.Equal(t1) {
+			logger.Printf("  警告: 响应中的原始时间戳与记录的T1不匹配!")
+		}
+		if !recvTime.Equal(t2) {
+			logger.Printf("  警告: 响应中的接收时间戳与记录的T2不匹配!")
+		}
+		if !transTime.Equal(t3) {
+			logger.Printf("  警告: 响应中的传输时间戳与记录的T3不匹配!")
+		}
+	}
+	
+	logger.Printf("[Req-%d] NTP响应包构建完成", reqID)
 }
 
 // NTP时间转换函数
@@ -456,4 +610,48 @@ func testNTPTimeConversion() {
 	}
 	
 	log.Println("所有时间转换测试完成")
+	
+	// 测试7: NTP响应包构建测试
+	log.Println("测试NTP响应包构建...")
+	req := make([]byte, 48)
+	req[0] = 0x1B // LI=0, VN=3, Mode=3 (Client)
+	req[2] = 6    // Poll=6 (64秒)
+	
+	t1 := time.Now().UTC().Add(-100 * time.Millisecond)
+	t2 := time.Now().UTC()
+	t3 := time.Now().UTC().Add(1 * time.Millisecond)
+	
+	resp := buildNTPResponse(req, t1, t2, t3, 999)
+	
+	// 验证响应包格式
+	if len(resp) != 48 {
+		log.Printf("错误: 响应包长度错误: %d (期望48)", len(resp))
+	} else {
+		respLiVnMode := resp[0]
+		respLi := (respLiVnMode >> 6) & 0x03
+		respVersion := (respLiVnMode >> 3) & 0x07
+		respMode := respLiVnMode & 0x07
+		
+		if respLi != 0 {
+			log.Printf("警告: 响应包LI字段应为0, 实际为: %d", respLi)
+		}
+		if respVersion != 3 {
+			log.Printf("警告: 响应包Version字段应为3, 实际为: %d", respVersion)
+		}
+		if respMode != 4 {
+			log.Printf("错误: 响应包Mode字段应为4(Server), 实际为: %d", respMode)
+		}
+		
+		respStratum := resp[1]
+		if respStratum != 1 {
+			log.Printf("警告: 响应包Stratum字段应为1, 实际为: %d", respStratum)
+		}
+		
+		respPoll := resp[2]
+		if respPoll < 4 || respPoll > 15 {
+			log.Printf("警告: 响应包Poll字段应在4-15范围内, 实际为: %d", respPoll)
+		}
+		
+		log.Println("NTP响应包构建测试完成")
+	}
 }
