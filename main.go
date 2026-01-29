@@ -11,7 +11,7 @@ import (
 
 var (
 	Version = "1.0.0"
-	Commit  = "9d7cd3e1236a0fcbe41cb703575973ddf6d4f375"
+	Commit  = "d62065c2d4f7de8aae08576911db8b171c915a7c"
 	Date    = "2026-01-29"
 )
 
@@ -24,6 +24,7 @@ const (
 
 var logger *log.Logger
 var requestCounter uint64
+var serverStartTime time.Time
 
 func initLogger() {
 	f, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -31,7 +32,10 @@ func initLogger() {
 		log.Fatalf("failed to open log file: %v", err)
 	}
 	logger = log.New(f, "", log.LstdFlags)
-	logger.Printf("NTP Server v%s started at %s", Version, time.Now().Format("2006-01-02 15:04:05"))
+	serverStartTime = time.Now()
+	logger.Printf("NTP Server v%s started at %s (UTC: %s)", Version, 
+		serverStartTime.Format("2006-01-02 15:04:05"), 
+		serverStartTime.UTC().Format("2006-01-02 15:04:05"))
 }
 
 func main() {
@@ -41,6 +45,7 @@ func main() {
 	testNTPTimeConversion()
 	
 	log.Printf("Starting NTP Server v%s (commit: %s, built: %s)", Version, Commit, Date)
+	log.Printf("Server UTC time: %s", time.Now().UTC().Format("2006-01-02 15:04:05.000000000"))
 	log.Printf("Server will respond as Stratum 1 (Primary Reference) with GPS clock source")
 
 	addr, err := net.ResolveUDPAddr("udp", port)
@@ -109,7 +114,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 		// 正常情况：从请求中解析T1
 		t1 = ntpToTime(transmitSec, transmitFrac)
 		
-		// FIX: 移除对T1的合理性检查，NTP服务器应信任客户端提供的时间戳
+		// 核心修复：NTP服务器应信任客户端提供的时间戳T1
 		// 客户端会根据服务器的T2、T3和原始T1计算时间偏移
 		if t1.IsZero() {
 			// 无效的时间戳（如1970年之前）
@@ -117,8 +122,7 @@ func handleNTPRequest(conn *net.UDPConn, addr *net.UDPAddr, req []byte) {
 			t1 = t2.Add(-5 * time.Millisecond)
 		} else {
 			// 记录时间戳，但不调整它
-			// NTP协议中，客户端发送的时间戳T1应该被服务器原样返回
-			// 客户端会基于服务器的T2、T3和这个T1来计算时间偏移
+			// 这是NTP协议的核心：服务器原样返回客户端的T1
 			logger.Printf("[Req-%d] Client %s sent T1=%s (UTC)", 
 				reqID, addr.IP, t1.Format("2006-01-02 15:04:05.000000000"))
 		}
@@ -179,9 +183,8 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	// 参考ID: 使用"GPS\0" (GPS时钟源)
 	copy(resp[12:16], []byte{'G', 'P', 'S', 0})
 	
-	// 参考时间戳: 使用服务器启动时间（或当前时间减去1秒）
-	// 在实际实现中，这应该是最后一次同步到参考源的时间
-	refTime := time.Now().UTC().Add(-1 * time.Second)
+	// 参考时间戳: 使用服务器启动时间
+	refTime := serverStartTime.UTC()
 	setNTPTime(resp[16:24], refTime)
 	
 	// 原始时间戳 (T1) - 必须与请求中的传输时间戳一致
@@ -196,15 +199,11 @@ func buildNTPResponse(req []byte, t1, t2, responseTime time.Time, reqID uint64) 
 	return resp
 }
 
-// 修复的NTP时间转换函数
+// NTP时间转换函数
 func ntpToTime(sec uint32, frac uint32) time.Time {
 	if sec == 0 && frac == 0 {
 		return time.Time{}
 	}
-	
-	// 处理NTP时间戳溢出问题
-	// NTP时间戳是64位，高32位是秒，低32位是分数
-	// 但这里只处理32位秒数，注意2036年溢出问题
 	
 	// 计算从1970年1月1日开始的秒数
 	var secondsSince1970 int64
@@ -212,10 +211,8 @@ func ntpToTime(sec uint32, frac uint32) time.Time {
 	// 处理2036年问题
 	if sec >= 4294967295-ntpEpochOffset { // 接近溢出
 		// 对于未来时间，使用更复杂的计算
-		// 这里简单处理，假设是1970年之后的时间
 		if sec < ntpEpochOffset {
 			// 如果sec小于ntpEpochOffset，说明是1900-1970年间的时间
-			// 这不应该在正常的NTP通信中出现
 			log.Printf("WARNING: Received pre-1970 NTP timestamp: %d (1900 + %d seconds)", sec, sec)
 			// 将其视为1970年之后的时间
 			secondsSince1970 = int64(sec)
@@ -306,8 +303,10 @@ func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, 
 	
 	// 计算时间差
 	var timeDiff string
+	var timeDiffSeconds float64
 	if !t1.IsZero() {
 		diff := t2.Sub(t1)
+		timeDiffSeconds = diff.Seconds()
 		if diff < 0 {
 			timeDiff = "-" + (-diff).String()
 		} else {
@@ -320,8 +319,8 @@ func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, 
 	logger.Printf("NTP版本: %d, 模式: %s", version, modeStr)
 	
 	if !t1.IsZero() {
-		logger.Printf("T1 (客户端发送):  %s", t1.Format("2006-01-02 15:04:05.000000000"))
-		logger.Printf("T2 (服务器接收):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("T1 (客户端发送时间):  %s", t1.Format("2006-01-02 15:04:05.000000000"))
+		logger.Printf("T2 (服务器接收时间):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
 		logger.Printf("时间差 (T2-T1):   %s", timeDiff)
 		
 		// 计算延迟
@@ -344,7 +343,15 @@ func logRequestDetails(reqID uint64, addr *net.UDPAddr, t1, t2, requestArrival, 
 		logger.Printf("时钟偏移估计:     %v", clockOffset)
 		
 		// 重要：显示服务器如何看待客户端的时间
-		logger.Printf("客户端时钟偏移:   %v (正值表示客户端比服务器快)", t1.Sub(t2))
+		clientClockOffset := t1.Sub(t2)
+		logger.Printf("客户端时钟偏移:   %v (正值表示客户端比服务器快)", clientClockOffset)
+		
+		// 记录时间差绝对值，帮助诊断
+		if timeDiffSeconds > 3600 { // 超过1小时
+			logger.Printf("警告: 客户端与服务器时间差超过1小时: %.2f小时", timeDiffSeconds/3600)
+		} else if timeDiffSeconds > 60 { // 超过1分钟
+			logger.Printf("注意: 客户端与服务器时间差超过1分钟: %.2f分钟", timeDiffSeconds/60)
+		}
 	} else {
 		logger.Printf("T1: (未设置或为0)")
 		logger.Printf("T2 (服务器接收):  %s", t2.Format("2006-01-02 15:04:05.000000000"))
@@ -387,7 +394,7 @@ func testNTPTimeConversion() {
 	}
 	
 	// 测试3: 特定时间 - 修复问题中的时间
-	testTime1 := time.Date(2026, 1, 29, 4, 38, 53, 698000000, time.UTC)
+	testTime1 := time.Date(2026, 1, 28, 22, 31, 39, 212744299, time.UTC)
 	log.Printf("测试时间1 (客户端时间): %s", testTime1.Format("2006-01-02 15:04:05.000000000"))
 	setNTPTime(buf[:], testTime1)
 	sec = binary.BigEndian.Uint32(buf[0:4])
@@ -402,7 +409,7 @@ func testNTPTimeConversion() {
 	}
 	
 	// 测试4: 服务器时间
-	testTime2 := time.Date(2026, 1, 29, 6, 19, 36, 550681000, time.UTC)
+	testTime2 := time.Date(2026, 1, 29, 6, 38, 45, 581648700, time.UTC)
 	log.Printf("测试时间2 (服务器时间): %s", testTime2.Format("2006-01-02 15:04:05.000000000"))
 	setNTPTime(buf[:], testTime2)
 	sec = binary.BigEndian.Uint32(buf[0:4])
