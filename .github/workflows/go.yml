@@ -3,16 +3,128 @@ name: Build and Release
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*', 'v*.*', 'v*.*.*' ]
   pull_request:
     branches: [ main ]
 
 env:
   APP_NAME: ntp-server
   BUILD_DIR: build
+  RELEASE_DIR: release-assets
 
 jobs:
-  build:
+  prepare:
+    name: Prepare Build Environment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.full_version }}
+      commit_hash: ${{ steps.version.outputs.commit_hash }}
+      build_time: ${{ steps.version.outputs.build_time }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate version info
+      id: version
+      run: |
+        # 获取版本信息
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        COMMIT_HASH=$(git rev-parse HEAD)
+        BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        
+        # 如果是标签推送，使用标签名
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION_TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="$VERSION_TAG"
+          RELEASE_TAG="$VERSION_TAG"
+        else
+          # 对于main分支推送，使用带时间戳的版本号
+          TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
+          VERSION="dev-${SHORT_SHA}-${TIMESTAMP}"
+          # 创建唯一的标签名，避免40位哈希
+          RELEASE_TAG="auto-build-${TIMESTAMP}"
+        fi
+        
+        echo "full_version=$VERSION" >> $GITHUB_OUTPUT
+        echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+        echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+        echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        
+        echo "Generated version: $VERSION"
+        echo "Release tag: $RELEASE_TAG"
+        echo "Commit: $SHORT_SHA"
+        echo "Build time: $BUILD_TIME"
+
+  package-source:
+    name: Package Source Code
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Create source packages
+      run: |
+        VERSION="${{ needs.prepare.outputs.version }}"
+        mkdir -p ${{ env.BUILD_DIR }}
+        
+        # 创建源代码包
+        SOURCE_TAR="${{ env.APP_NAME }}-source-$VERSION.tar.gz"
+        SOURCE_ZIP="${{ env.APP_NAME }}-source-$VERSION.zip"
+        
+        echo "Creating source packages for version: $VERSION"
+        echo "Creating $SOURCE_TAR and $SOURCE_ZIP"
+        
+        # 排除构建目录和隐藏文件
+        tar -czf ${{ env.BUILD_DIR }}/$SOURCE_TAR \
+          --exclude='.git' \
+          --exclude='.github' \
+          --exclude='.gitignore' \
+          --exclude='.idea' \
+          --exclude='.vscode' \
+          --exclude='*.swp' \
+          --exclude='*.swo' \
+          --exclude='${{ env.BUILD_DIR }}' \
+          .
+        
+        # 创建ZIP包
+        zip -r ${{ env.BUILD_DIR }}/$SOURCE_ZIP . \
+          -x '*.git*' \
+          -x '*.github*' \
+          -x '.idea/*' \
+          -x '.vscode/*' \
+          -x '*.swp' \
+          -x '*.swo' \
+          -x '${{ env.BUILD_DIR }}/*'
+        
+        # 计算源代码包哈希
+        cd ${{ env.BUILD_DIR }}
+        sha256sum $SOURCE_TAR > $SOURCE_TAR.sha256
+        sha256sum $SOURCE_ZIP > $SOURCE_ZIP.sha256
+        cd ..
+        
+        echo "Created source packages: $SOURCE_TAR, $SOURCE_ZIP"
+        ls -lh ${{ env.BUILD_DIR }}
+
+    - name: Upload source artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: source-packages-${{ needs.prepare.outputs.short_sha }}
+        path: ${{ env.BUILD_DIR }}/${{ env.APP_NAME }}-source-*
+        retention-days: 1
+
+  build-binaries:
     name: Build Binaries
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,7 +146,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # 获取完整历史记录，用于版本信息
+        fetch-depth: 0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -47,65 +159,176 @@ jobs:
         GOOS: ${{ matrix.os }}
         GOARCH: ${{ matrix.arch }}
         OUTPUT_FILE: ${{ matrix.output }}
-        VERSION: ${{ github.sha }}
-        COMMIT: ${{ github.sha }}
-        BUILD_DATE: ${{ github.event.repository.updated_at }}
+        VERSION: ${{ needs.prepare.outputs.version }}
+        COMMIT: ${{ needs.prepare.outputs.commit_hash }}
+        BUILD_DATE: ${{ needs.prepare.outputs.build_time }}
       run: |
         mkdir -p ${{ env.BUILD_DIR }}
+        echo "Building $OUTPUT_FILE for $GOOS/$GOARCH"
+        echo "Version: $VERSION, Commit: $COMMIT, Build Date: $BUILD_DATE"
+        
         go build -ldflags "\
           -X 'main.Version=$VERSION' \
           -X 'main.Commit=$COMMIT' \
           -X 'main.Date=$BUILD_DATE'" \
           -o ${{ env.BUILD_DIR }}/$OUTPUT_FILE main.go
-        echo "Built $OUTPUT_FILE for $GOOS/$GOARCH"
+        
+        # 计算文件哈希
+        cd ${{ env.BUILD_DIR }}
+        if [[ "$GOOS" == "windows" ]]; then
+          sha256sum "$OUTPUT_FILE" > "$OUTPUT_FILE.sha256"
+        else
+          shasum -a 256 "$OUTPUT_FILE" > "$OUTPUT_FILE.sha256"
+        fi
+        cd ..
+        
+        echo "Built: ${{ env.BUILD_DIR }}/$OUTPUT_FILE"
 
-    - name: Upload artifacts
+    - name: Upload binary artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.output }}
-        path: ${{ env.BUILD_DIR }}/${{ matrix.output }}
-        
+        name: binary-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.prepare.outputs.short_sha }}
+        path: |
+          ${{ env.BUILD_DIR }}/${{ matrix.output }}
+          ${{ env.BUILD_DIR }}/${{ matrix.output }}.sha256
+        retention-days: 1
+
   release:
     name: Create Release
-    needs: build
+    needs: [prepare, package-source, build-binaries]
     runs-on: ubuntu-latest
-    # 修改触发条件：在推送到 main 分支时创建发布，同时保留标签推送时创建正式发布的能力
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
-    
+      id-token: write
+      attestations: write
+
     steps:
-    - name: Download all artifacts
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download source artifacts
       uses: actions/download-artifact@v4
       with:
-        path: artifacts
+        name: source-packages-${{ needs.prepare.outputs.short_sha }}
+        path: ${{ env.RELEASE_DIR }}
 
-    - name: Prepare release assets
+    - name: Download binary artifacts
       run: |
-        mkdir -p release-assets
-        find artifacts -type f -exec cp {} release-assets \;
-        ls -lh release-assets/
+        mkdir -p ${{ env.RELEASE_DIR }}
+        # 为每个平台下载对应的构件
+        platforms=("linux-amd64" "windows-amd64" "darwin-amd64" "darwin-arm64")
+        for platform in "${platforms[@]}"; do
+          echo "Downloading artifact for platform: $platform"
+          artifact_name="binary-${platform}-${{ needs.prepare.outputs.short_sha }}"
+          if gh api /repos/${{ github.repository }}/actions/artifacts --jq ".artifacts[] | select(.name == \"$artifact_name\") | .id" > /tmp/artifact_id.txt 2>/dev/null; then
+            artifact_id=$(cat /tmp/artifact_id.txt)
+            if [ -n "$artifact_id" ]; then
+              echo "Downloading artifact ID: $artifact_id"
+              gh api /repos/${{ github.repository }}/actions/artifacts/$artifact_id/zip > /tmp/artifact.zip
+              unzip -o /tmp/artifact.zip -d ${{ env.RELEASE_DIR }}/
+              rm /tmp/artifact.zip
+            fi
+          fi
+        done
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create git tag for main branch builds
+      if: github.ref == 'refs/heads/main'
+      run: |
+        TAG_NAME="${{ needs.prepare.outputs.release_tag }}"
+        echo "Creating git tag: $TAG_NAME"
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git tag -a "$TAG_NAME" -m "Automated build from main branch - ${{ needs.prepare.outputs.full_version }}"
+        git push origin "$TAG_NAME"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: List all release assets
+      run: |
+        echo "=== Release assets in ${{ env.RELEASE_DIR }} ==="
+        find ${{ env.RELEASE_DIR }} -type f | sort
+        echo ""
+        echo "=== File sizes ==="
+        find ${{ env.RELEASE_DIR }} -type f -exec ls -lh {} \;
+        echo ""
+        echo "=== SHA256 checksums ==="
+        find ${{ env.RELEASE_DIR }} -name "*.sha256" -exec cat {} \;
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        RELEASE_TITLE=""
+        RELEASE_BODY=""
+        
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          RELEASE_TITLE="Release $TAG_NAME"
+          RELEASE_BODY="## Release $TAG_NAME
+          
+          ### Changes
+          This is a tagged release version $TAG_NAME
+          
+          ### Assets
+          This release contains binaries for multiple platforms and source code packages.
+          
+          ### Build Information
+          - **Version**: ${{ needs.prepare.outputs.version }}
+          - **Commit**: ${{ needs.prepare.outputs.short_sha }}
+          - **Build Time**: ${{ needs.prepare.outputs.build_time }}
+          - **Triggered by**: ${{ github.actor }}"
+        else
+          SHORT_SHA="${{ needs.prepare.outputs.short_sha }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S")
+          RELEASE_TITLE="Auto Build from main ($SHORT_SHA)"
+          RELEASE_BODY="## Automated Build
+          
+          This is an automated build from the main branch.
+          
+          ### Assets
+          This release contains binaries for multiple platforms and source code packages.
+          
+          ### Build Information
+          - **Version**: ${{ needs.prepare.outputs.version }}
+          - **Commit**: ${{ needs.prepare.outputs.short_sha }}
+          - **Build Time**: ${{ needs.prepare.outputs.build_time }}
+          - **Triggered by**: ${{ github.actor }}
+          - **Source**: ${{ github.ref }}
+          - **Generated at**: $TIMESTAMP
+          
+          ### Notes
+          This is a pre-release. Use tagged releases for production."
+        fi
+        
+        echo "release_title=$RELEASE_TITLE" >> $GITHUB_OUTPUT
+        echo "release_body<<EOF" >> $GITHUB_OUTPUT
+        echo "$RELEASE_BODY" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
-        # 根据触发源决定标签名：标签推送用标签名，main 分支推送用提交 SHA
-        tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
-        # 根据触发源决定发布名称
-        name: ${{ startsWith(github.ref, 'refs/tags/') && format('Release {0}', github.ref_name) || format('Auto Build from main ({0})', github.sha) }}
-        body: |
-          ## Automated Build
-          - **Trigger**: ${{ startsWith(github.ref, 'refs/tags/') && 'Tag Push' || 'Main Branch Push' }}
-          - **Ref**: ${{ github.ref }}
-          - **Commit**: ${{ github.sha }}
-          - **Built by**: ${{ github.actor }}
-          - **Build Time**: ${{ github.event.repository.updated_at }}
-          
-          ## Assets
-          This release contains binaries for multiple platforms.
-        files: release-assets/*
+        tag_name: ${{ needs.prepare.outputs.release_tag }}
+        name: ${{ steps.release_notes.outputs.release_title }}
+        body: ${{ steps.release_notes.outputs.release_body }}
+        files: ${{ env.RELEASE_DIR }}/*
         draft: false
-        # 如果是 main 分支推送，标记为预发布版本；标签推送则为正式发布
         prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        generate_release_notes: false
+        make_latest: ${{ startsWith(github.ref, 'refs/tags/') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Display release information
+      run: |
+        echo "=== Release created successfully! ==="
+        echo "Version: ${{ needs.prepare.outputs.version }}"
+        echo "Tag: ${{ needs.prepare.outputs.release_tag }}"
+        echo "Release Type: ${{ startsWith(github.ref, 'refs/tags/') && 'Official Release' || 'Pre-release' }}"
+        echo ""
+        echo "=== Assets uploaded ==="
+        find ${{ env.RELEASE_DIR }} -type f | xargs -I {} basename {} | sort
